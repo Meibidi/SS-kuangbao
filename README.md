@@ -1,1 +1,1 @@
-CREATE TABLE ips (   id INTEGER PRIMARY KEY,   ip TEXT NOT NULL,   name TEXT,   active INTEGER DEFAULT 1,   priority INTEGER DEFAULT 0 )
+使用UUID.bat转换自己想要的十进制解码格式进行UUID替换
