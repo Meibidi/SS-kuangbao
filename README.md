@@ -1,0 +1,1 @@
+CREATE TABLE ips (   id INTEGER PRIMARY KEY,   ip TEXT NOT NULL,   name TEXT,   active INTEGER DEFAULT 1,   priority INTEGER DEFAULT 0 )
