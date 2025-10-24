@@ -1,5 +1,5 @@
 import{connect as C}from'cloudflare:sockets'
-const W=new Map,U=new Uint8Array([145,203,32,2,109,85,72,237,169,217,101,189,251,27,147,165]),
+const W=new Map,U=new Uint8Array([145,203,32,2,109,85,72,237,169,217,101,189,251,27,147,165]), //UUID解码后位置
 M=new Uint8Array(32768),P=new Array(12),H=new Uint8Array(2),E=[new Response(null,{status:400}),new Response(null,{status:502})],
 A=s=>{const o=19+s[17],p=s[o]<<8|s[o+1],b=o+3,y=s[o+2]&1;return[y?s[b]+'.'+s[b+1]+'.'+s[b+2]+'.'+s[b+3]:new TextDecoder().decode(s.subarray(b+1,b+1+s[b])),p,y?b+4:b+1+s[b]]},
 B=(h,p)=>{try{const s=C({hostname:h,port:p});return s.opened.then(()=>s,()=>0)}catch{return Promise.resolve(0)}}
