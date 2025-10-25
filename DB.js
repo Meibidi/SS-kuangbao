@@ -1,6 +1,6 @@
 // Config
 const UUID = '', //UUID
-	HOST = 'sjc.o00o.ooo'; //自定义域名或者Snippets域名指向
+	HOST = ''; //自定义域名或者Snippets域名指向
 const REGIONS = ['HK', 'TW', 'JP', 'SG', 'KR', 'US']; //控制想要排列的顺序
 const PAGE_SIZE = 30,
 	BATCH_SIZE = 50,
@@ -1188,7 +1188,7 @@ const getHTML = () => `<!DOCTYPE html>
 		<h2>批量操作</h2>
 		<div class="form-group">
 			<label>节点列表（每行一个，支持 IP:端口#名称 格式）</label>
-			<textarea id="batchIps" placeholder="192.168.1.1:443#香港-HK&#10;[2001:db8::1]:443#日本-JP&#10;example.com:443#美国-US"></textarea>
+			<textarea id="batchIps" placeholder="192.168.1.1:443#香港-HK&#10;[2001:db8::1]:443#日本-JP&#10;example.com:443#美国-US&#10;导入：格式仅支持IP:PORT#NAME&#10;删除：格式支持直接使用节点链接，会自动提取IP和PROT匹配删除"></textarea>
 		</div>
 		<div class="batch-actions">
 			<button onclick="batchImport()">批量导入</button>
