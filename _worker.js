@@ -2,7 +2,7 @@ import { connect as connectSocket } from 'cloudflare:sockets'
 
 // === 常量与缓存结构 ===
 const socketMap = new Map() // 存放 WebSocket 对象和其状态
-const UUID_STRING = 'aaad8e79-c3ca-4e87-a4db-12e43e9e5411'
+const UUID_STRING = ''//UUID
 const UUID_BYTES = new Uint8Array(
   UUID_STRING.replace(/-/g, '').match(/.{2}/g).map(x => parseInt(x, 16))
 )
