@@ -4,7 +4,7 @@ import { connect as connectSocket } from 'cloudflare:sockets'
 const socketMap = new Map()
 
 // 使用标准 UUID 格式
-const UUID_STRING = '' //UUID
+const UUID_STRING = ''
 const UUID_BYTES = new Uint8Array(
   UUID_STRING.replace(/-/g, '').match(/.{2}/g).map(x => parseInt(x, 16))
 )
@@ -93,7 +93,7 @@ export default {
     // 建立远程连接
     const remote =
       (await openRemoteSocket(targetHost, targetPort)) ||
-      (await openRemoteSocket('proxy.xxxxxxxx.tk', 50001)) //Proxyip
+      (await openRemoteSocket('proxy.xxxxxxxx.tk', 50001))
     if (!remote) {
       recycle()
       return RESPONSES[1]
