@@ -1,24 +1,29 @@
-import{connect as C}from'cloudflare:sockets'
-const W=new Map,U=new Uint8Array([207,164,66,231,10,98,92,23,153,27,78,44,147,137,198,95]),
-M=new Uint8Array(32768),P=new Array(12),E=[new Response(null,{status:400}),new Response(null,{status:502})],
-A=s=>{const o=19+s[17],p=s[o]<<8|s[o+1],b=o+3,y=s[o+2]&1,n=s[b];return[y?s[b]+'.'+s[b+1]+'.'+s[b+2]+'.'+s[b+3]:new TextDecoder().decode(s.subarray(b+1,b+1+n)),p,y?b+4:b+1+n,s[0]]},
-B=(h,p)=>{const s=C({hostname:h,port:p});return s.opened.then(()=>s,()=>0).catch(()=>0)}
-let m=0,l=0
+import{connect as C}from'cloudflare:sockets';
+const W=new Map(),U=new Uint8Array([207,164,66,231,10,98,92,23,153,27,78,44,147,137,198,95]),M=new Uint8Array(32768),P=Array(12);
+const A=s=>{const o=19+s[17],p=s[o]<<8|s[o+1],b=o+3,y=s[o+2]&1,n=s[b];const h=y?s[b]+'.'+s[b+1]+'.'+s[b+2]+'.'+s[b+3]:new TextDecoder().decode(s.subarray(b+1,b+1+n));const z=y?b+4:b+1+n;return[h,p,z,s[0]]};
+const B=(h,p)=>{try{const s=C({hostname:h,port:p});return s.opened.then(()=>s).catch(()=>null)}catch{return null}};
+let m=0,l=0;
 export default{async fetch(r){
-if(r.headers.get('upgrade')!=='websocket')return E[1]
-const h=r.headers.get('sec-websocket-protocol');if(!h)return E[0]
-const d=atob(h.replace(/[-_]/g,x=>x<'.'?'+':'/')),n=d.length;if(n<18)return E[0]
-const t=m+n<32768,s=t?new Uint8Array(M.buffer,m,m+=n):l?P[--l]||new Uint8Array(n):new Uint8Array(n),F=()=>{t?m>24576&&(m=0)||(m-=n):l<12&&!P[l]&&(P[l++]=s)}
-for(let i=n;i--;)s[i]=d.charCodeAt(i)
-if(s[0]){F();return E[0]}
-for(let i=16;i--;)if(s[i+1]^U[i]){F();return E[0]}
-const[x,p,z,v]=A(s),k=await B(x,p)||await B('proxy.xxxxxxxx.tk',50001);if(!k){F();return E[1]}
-const{0:c,1:ws}=new WebSocketPair,w=k.writable.getWriter(),f=[1,0,1]
-ws.accept();W.set(ws,f);n>z&&w.write(s.subarray(z)).catch(()=>f[0]=0);F()
-const L=()=>f[0]&&(f[0]=0,w.releaseLock(),((c)=>{try{ws.close(c)}catch{};try{k.close()}catch{};W.delete(ws);W.size>999&&W.clear()})(f[1]))
-ws.addEventListener('message',e=>f[0]&&w.write(e.data).catch(()=>f[0]=0))
-ws.addEventListener('close',()=>{f[1]=1e3;L()})
-ws.addEventListener('error',()=>{f[1]=1006;L()})
-k.readable.pipeTo(new WritableStream({write(d){if(f[0]){if(f[2]){const u=new Uint8Array(d),h=new Uint8Array(u.length+2);h[0]=v;h.set(u,2);ws.send(h.buffer);f[2]=0}else ws.send(d)}},close(){f[1]=1e3;L()},abort(){f[1]=1006;L()}})).catch(()=>{})
+if(r.headers.get('upgrade')?.toLowerCase()!=='websocket')return new Response('Upgrade Required',{status:426,headers:{'Connection':'Upgrade','Upgrade':'websocket'}});
+const h=r.headers.get('sec-websocket-protocol');if(!h)return new Response(null,{status:400});
+let d;try{d=atob(h.replace(/[-_]/g,x=>x<'.'?'+':'/'))}catch(e){return new Response(null,{status:400})}
+const n=d.length;if(n<18)return new Response(null,{status:400});
+const t=m+n<32768;let s;
+if(t){s=new Uint8Array(M.buffer,m,n);m+=n}else{s=l>0?P[--l]||new Uint8Array(n):new Uint8Array(n)}
+const F=()=>{if(t){if(m>24576)m=0}else if(l<12){P[l++]=s.buffer.byteLength===s.length?s:new Uint8Array(s.buffer)}};
+for(let i=n;i--;)s[i]=d.charCodeAt(i);
+for(let i=16;i--;){if(s[i+1]^U[i]){F();return new Response(null,{status:400})}}
+const[x,p,z,v]=A(s);const k=await B(x,p)||await B('proxy.xxxxxxxx.tk',50001);
+if(!k){F();return new Response(null,{status:502})}
+const{0:c,1:ws}=new WebSocketPair();ws.accept();const w=k.writable.getWriter();
+const state={alive:true,firstChunk:true};
+const cleanup=()=>{if(!state.alive)return;state.alive=false;try{w.releaseLock()}catch{}try{k.close()}catch{}try{ws.close(1000)}catch{}W.delete(ws)};
+W.set(ws,cleanup);
+if(n>z){w.write(s.subarray(z)).catch(cleanup)}
+F();
+ws.addEventListener('message',e=>{if(state.alive)w.write(e.data).catch(cleanup)});
+ws.addEventListener('close',cleanup);
+ws.addEventListener('error',cleanup);
+k.readable.pipeTo(new WritableStream({write(c){if(state.alive){if(state.firstChunk){state.firstChunk=false;const u=new Uint8Array(c),h=new Uint8Array(u.length+2);h[0]=v;h.set(u,2);ws.send(h)}else{ws.send(c)}}},close:cleanup,abort:cleanup})).catch(cleanup);
 return new Response(null,{status:101,webSocket:c})
-}}
+}};
