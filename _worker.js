@@ -1,5 +1,5 @@
 import{connect as C}from'cloudflare:sockets'
-const W=new Map,U=new Uint8Array([207,164,66,231,10,98,92,23,153,27,78,44,147,137,198,95]]),
+const W=new Map,U=new Uint8Array([207,164,66,231,10,98,92,23,153,27,78,44,147,137,198,95]),
 M=new Uint8Array(32768),P=Array(12),E=[new Response(null,{status:400}),new Response(null,{status:502})],
 A=s=>{const o=19+s[17],p=s[o]<<8|s[o+1],b=o+3,y=s[o+2]&1,n=s[b];return[y?s[b]+'.'+s[b+1]+'.'+s[b+2]+'.'+s[b+3]:new TextDecoder().decode(s.subarray(b+1,b+1+n)),p,y?b+4:b+1+n,s[0]]},
 B=(h,p)=>{const s=C({hostname:h,port:p});return s.opened.then(()=>s).catch(()=>0)}
@@ -21,3 +21,4 @@ ws.addEventListener('error',()=>{f[0]=0;w.releaseLock();try{ws.close(1006)}catch
 k.readable.pipeTo(new WritableStream({write(d){if(f[0]&&f[1]){const u=new Uint8Array(d),h=new Uint8Array(u.length+2);h[0]=v;h.set(u,2);ws.send(h.buffer);f[1]=0}else f[0]&&ws.send(d)},close(){f[0]=0;w.releaseLock();try{ws.close(1e3)}catch{};try{k.close()}catch{};W.delete(ws);W.size>999&&W.clear()},abort(){f[0]=0;w.releaseLock();try{ws.close(1006)}catch{};try{k.close()}catch{};W.delete(ws);W.size>999&&W.clear()}})).catch(()=>{})
 return new Response(null,{status:101,webSocket:c})
 }}
+
