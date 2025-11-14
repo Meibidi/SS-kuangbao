@@ -1,477 +1,482 @@
-// Config
-const UUID = '', //UUID
-	HOST = ''; //自定义域名或者Snippets域名指向
-const REGIONS = ['HK', 'TW', 'JP', 'SG', 'KR', 'US']; //控制想要排列的顺序
-const PAGE_SIZE = 30,
-	BATCH_SIZE = 50,
-	MAX_VLESS = 500;
+// --- 全局配置 ---
+const UUID = '';
+const HOST = ''; // 默认的 VLESS host
+const REGIONS = ['HK', 'TW', 'JP', 'SG', 'KR', 'US']; // 地区排序优先级
+const PAGE_SIZE = 30; // 分页大小
+const BATCH_SIZE = 50; // D1 数据库批量操作大小，50 是一个安全值
+const MAX_VLESS = 500; // VLESS 订阅链接的最大节点数
 
+// --- 性能优化：预编译正则表达式 & 查找表 ---
+// 一个健壮的正则表达式，用于解析各种IP格式: [IPv6]:port#name, IPv4:port#name, domain:port#name
+const IP_FORMAT_REGEX = /^(\[[a-fA-F0-9:]+\]|[^:#\[\]]+)(?::(\d+))?(#.*)?$/;
+const VLESS_EXTRACT_REGEX = /@([^?:]+:[^?]+)\??/; // 从 VLESS 链接中提取 IP:Port
+// 预编译地区正则表达式，避免在循环中重复创建，这是显著的性能提升点。
+const PRECOMPILED_REGION_REGEX = new Map(REGIONS.map(r => [r, new RegExp(r, 'i')]));
+
+// --- 工具函数 ---
 const json = (d, s = 200) => Response.json(d, { status: s });
 const err = (m, s = 400) => Response.json({ error: m }, { status: s });
 
+// 内存中的任务状态回退机制，以防 KV 写入失败或延迟
 const tasks = {};
 
+// 批量执行 D1 数据库语句，避免超出单次 batch 的限制
 const execBatches = async (db, statements) => {
-	for (let i = 0; i < statements.length; i += BATCH_SIZE) {
-		await db.batch(statements.slice(i, i + BATCH_SIZE));
-	}
+    for (let i = 0; i < statements.length; i += BATCH_SIZE) {
+        await db.batch(statements.slice(i, i + BATCH_SIZE));
+    }
 };
 
+// --- 经过优化的 IP 和地区解析函数 ---
+
+// 统一格式化 IP 输入，确保数据一致性
 const formatIP = (ip) => {
-	const t = ip.trim();
-	if (!t) return null;
-	if (t.startsWith('[')) {
-		const e = t.indexOf(']');
-		if (e > -1) {
-			const ipv6 = t.substring(0, e + 1),
-				rest = t.substring(e + 1);
-			if (rest.startsWith(':')) {
-				const m = rest.match(/^:(\d+)(#.*)?$/);
-				if (m) return `${ipv6}:${m[1]}${m[2] || ''}`;
-			} else if (rest.startsWith('#') || !rest) return `${ipv6}:443${rest || ''}`;
-		}
-	}
-	const h = t.indexOf('#');
-	let ipPart = h > -1 ? t.substring(0, h) : t;
-	const namePart = h > -1 ? t.substring(h) : '';
-	if (!ipPart.includes(':')) ipPart += ':443';
-	return `${ipPart}${namePart}`;
+    const t = ip.trim();
+    if (!t) return null;
+    const match = t.match(IP_FORMAT_REGEX);
+    if (!match) return null; // 格式无效
+
+    const [, ipPart, portPart, namePart] = match;
+    const port = portPart || '443'; // 默认端口为 443
+    return `${ipPart}:${port}${namePart || ''}`;
 };
 
+// 从格式化的 IP 字符串中解析出各个部分
 const parseIP = (ip) => {
-	if (ip.startsWith('[')) {
-		const e = ip.indexOf(']'),
-			ipv6 = ip.substring(0, e + 1),
-			m = ip.substring(e + 1).match(/^:(\d+)/);
-		return { displayIp: ipv6, port: m ? m[1] : '443' };
-	}
-	const [i, p = '443'] = ip.split('#')[0].split(':');
-	return { displayIp: i, port: p };
+    const match = ip.match(IP_FORMAT_REGEX);
+    if (!match) return { displayIp: ip, port: 'N/A', name: '' };
+    
+    const [, ipPart, portPart, namePart] = match;
+    return {
+        displayIp: ipPart,
+        port: portPart || '443',
+        name: (namePart || '').substring(1), // 移除前导 '#'
+    };
 };
 
-// 新增函数：提取纯IP地址（不包含端口）
-const extractPureIP = (ip) => {
-	if (ip.startsWith('[')) {
-		const e = ip.indexOf(']');
-		return e > -1 ? ip.substring(0, e + 1) : ip;
-	}
-	const colonIndex = ip.indexOf(':');
-	return colonIndex > -1 ? ip.substring(0, colonIndex) : ip;
+// 提取纯 IP 地址（不含端口和名称）
+const extractPureIP = (ip) => ip.match(IP_FORMAT_REGEX)?.[1] || ip;
+
+// 从节点名称中提取地区信息
+const extractRegion = (name) => {
+    if (!name) return '';
+    // 使用预编译的正则表达式进行匹配，性能更高
+    for (const [region, regex] of PRECOMPILED_REGION_REGEX.entries()) {
+        if (regex.test(name)) return region;
+    }
+    return '';
 };
 
-const extractRegion = (n) => (n ? REGIONS.find((r) => new RegExp(r, 'i').test(n)) || '' : '');
+// --- 经过优化的排序函数 ---
+const sortByRegion = (ips) => {
+    // 创建地区排序的查找表 (Map)，比 indexOf 更快
+    const REGION_ORDER = new Map(REGIONS.map((r, i) => [r, i]));
+    const UNKNOWN_REGION_INDEX = REGIONS.length;
 
+    // 预先计算排序键，使得 sort 的比较函数极其快速。
+    // 将昂贵的计算（如提取地区）从 O(N log N) 降低到 O(N)。
+    const sortableIps = ips.map(ip => ({
+        ...ip,
+        _regionIndex: ip.region ? (REGION_ORDER.get(ip.region) ?? UNKNOWN_REGION_INDEX) : UNKNOWN_REGION_INDEX,
+        _isV6: ip.displayIp.startsWith('[') ? 0 : 1, // IPv6 优先
+    }));
+
+    // 执行排序，比较函数现在只进行简单的数字比较
+    return sortableIps.sort((a, b) => 
+        a._regionIndex - b._regionIndex || // 按地区索引排序
+        a.priority - b.priority ||         // 按优先级排序
+        a._isV6 - b._isV6 ||               // 按 IP 版本排序 (v6在前)
+        a.id - b.id                        // 按原始 ID 排序作为最终保障
+    );
+};
+
+// --- 其他工具函数 ---
 const generateVless = (ip, host) => {
-	const { displayIp, port } = parseIP(ip.ip);
-	const name = ip.name ? encodeURIComponent(ip.name) : encodeURIComponent(displayIp.replace(/[\.\[\]:]/g, '-') + '-' + port);
-	return `vless://${UUID}@${displayIp}:${port}?encryption=none&security=tls&type=ws&host=${host}&path=%2F%3Fed%3D2560&sni=${host}#${name}`;
+    const { displayIp, port, name } = parseIP(ip.ip);
+    const encodedName = name ? encodeURIComponent(name) : encodeURIComponent(`${displayIp.replace(/[\.\[\]:]/g, '-')}-${port}`);
+    const effectiveHost = host || displayIp;
+    return `vless://${UUID}@${displayIp}:${port}?encryption=none&security=tls&type=ws&host=${effectiveHost}&path=%2F%3Fed%3D2560&sni=${effectiveHost}#${encodedName}`;
 };
 
-const sortByRegion = (ips) =>
-	ips.sort((a, b) => {
-		const ar = extractRegion(a.name || ''),
-			br = extractRegion(b.name || '');
-		let ai = REGIONS.indexOf(ar),
-			bi = REGIONS.indexOf(br);
-		if (ai === -1) ai = REGIONS.length;
-		if (bi === -1) bi = REGIONS.length;
-		const regionDiff = ai - bi;
-		if (regionDiff) return regionDiff;
-		if (a.priority !== b.priority) return a.priority - b.priority;
-		const aIsV6 = a.displayIp.startsWith('[') ? 0 : 1,
-			bIsV6 = b.displayIp.startsWith('[') ? 0 : 1;
-		if (aIsV6 !== bIsV6) return aIsV6 - bIsV6;
-		return a.id - b.id;
-	});
-
+// 保存异步任务状态，同时写入 KV 和内存
 const saveTask = async (kv, id, status, msg = '') => {
-	const data = { status, message: msg, timestamp: Date.now() };
-	if (kv) {
-		await kv.put(`task:${id}`, JSON.stringify(data), { expirationTtl: 300 }).catch(() => {});
-	}
-	tasks[id] = data;
-	setTimeout(() => delete tasks[id], 300000);
+    const data = { status, message: msg, timestamp: Date.now() };
+    tasks[id] = data; // 内存回退
+    setTimeout(() => delete tasks[id], 300000); // 5分钟后清理内存中的任务
+    if (kv) {
+        await kv.put(`task:${id}`, JSON.stringify(data), { expirationTtl: 300 }).catch(console.error);
+    }
 };
 
+// 获取异步任务状态，优先从内存读取
 const getTask = async (kv, id) => {
-	if (kv) {
-		try {
-			const data = await kv.get(`task:${id}`);
-			if (data) return JSON.parse(data);
-		} catch {}
-	}
-	return tasks[id] || null;
+    if (tasks[id]) return tasks[id];
+    if (kv) {
+        try {
+            const data = await kv.get(`task:${id}`);
+            return data ? JSON.parse(data) : null;
+        } catch { /* 忽略读取错误 */ }
+    }
+    return null;
 };
 
+// --- API 实现 (优化版) ---
 const api = {
-	async getIps(db, params) {
-		const page = parseInt(params.get('page') || '1');
-		const limit = parseInt(params.get('limit') || PAGE_SIZE);
-		const offset = (page - 1) * limit;
-		const needTotal = params.get('needTotal') === 'true';
+    async getIps(db, params) {
+        const page = parseInt(params.get('page') || '1');
+        const limit = parseInt(params.get('limit') || PAGE_SIZE);
+        const offset = (page - 1) * limit;
 
-		if (needTotal) {
-			const [{ results }, { total }] = await Promise.all([
-				db.prepare('SELECT id,ip,name,active,priority FROM ips ORDER BY id LIMIT ? OFFSET ?').bind(limit, offset).all(),
-				db.prepare('SELECT COUNT(*)as total FROM ips').first(),
-			]);
-			return json({
-				ips: results.map((r) => ({ ...r, ...parseIP(r.ip), name: r.name || '', region: extractRegion(r.name || '') })),
-				pagination: { page, limit, total, pages: Math.ceil(total / limit) },
-			});
-		}
+        const baseQuery = db.prepare('SELECT id, ip, name, active, priority FROM ips ORDER BY id LIMIT ? OFFSET ?').bind(limit, offset);
+        
+        // 如果前端不需要总页数，则不执行 COUNT 查询，以提高性能
+        if (params.get('needTotal') !== 'true') {
+            const { results } = await baseQuery.all();
+            const ips = results.map(r => ({ ...r, ...parseIP(r.ip), region: extractRegion(r.name) }));
+            return json({ ips, pagination: { page, limit } });
+        }
 
-		const { results } = await db.prepare('SELECT id,ip,name,active,priority FROM ips ORDER BY id LIMIT ? OFFSET ?').bind(limit, offset).all();
-		return json({
-			ips: results.map((r) => ({ ...r, ...parseIP(r.ip), name: r.name || '', region: extractRegion(r.name || '') })),
-			pagination: { page, limit },
-		});
-	},
+        // 使用 db.batch 一次性执行两个查询，效率更高
+        const countQuery = db.prepare('SELECT COUNT(*) as total FROM ips');
+        const [data, totalResult] = await db.batch([baseQuery, countQuery]);
+        
+        const ips = data.results.map(r => ({ ...r, ...parseIP(r.ip), region: extractRegion(r.name) }));
+        const total = totalResult.results[0].total;
 
-	async getStats(db) {
-		const { total, active } = await db.prepare('SELECT COUNT(*)as total,SUM(CASE WHEN active=1 THEN 1 ELSE 0 END)as active FROM ips').first();
-		return json({ total, active: active || 0, inactive: total - (active || 0) });
-	},
+        return json({
+            ips,
+            pagination: { page, limit, total, pages: Math.ceil(total / limit) },
+        });
+    },
 
-	async getTaskStatus(kv, taskId) {
-		const task = await getTask(kv, taskId);
-		if (!task) return err('任务不存在', 404);
-		return json(task);
-	},
+    async getStats(db) {
+        // 使用 SUM(active) 比 SUM(CASE...) 更简洁高效
+        const { total, active } = await db.prepare('SELECT COUNT(*) as total, SUM(active) as active FROM ips').first();
+        return json({ total, active: active || 0, inactive: total - (active || 0) });
+    },
 
-	async addIp(db, { ip, priority }) {
-		if (!ip) return err('IP不能为空');
-		const formatted = formatIP(ip);
-		if (!formatted) return err('IP格式错误');
-		const [ipPort, name] = formatted.split('#');
-		const prio = priority || (await db.prepare('SELECT COALESCE(MAX(priority),0)+1 as n FROM ips').first()).n;
-		const result = await db.prepare('INSERT OR IGNORE INTO ips(ip,name,active,priority)VALUES(?,?,1,?)').bind(ipPort, name || null, prio).run();
-		if (result.meta.changes === 0) return err('IP已存在');
-		return json({ success: true });
-	},
+    async getTaskStatus(kv, taskId) {
+        const task = await getTask(kv, taskId);
+        if (!task) return err('任务不存在或已过期', 404);
+        return json(task);
+    },
 
-	async batchImport(db, { ips }, ctx, kv) {
-		if (!Array.isArray(ips) || !ips.length) return err('列表为空');
-		const taskId = crypto.randomUUID();
-		const importTask = async () => {
-			try {
-				await saveTask(kv, taskId, 'running', '准备导入');
-				const { p } = await db.prepare('SELECT COALESCE(MAX(priority),0)as p FROM ips').first();
-				const stmt = db.prepare('INSERT OR IGNORE INTO ips(ip,name,active,priority)VALUES(?,?,1,?)');
-				const batch = ips
-					.map((ip, i) => {
-						const formatted = formatIP(ip.trim());
-						if (!formatted) return null;
-						const [ipPort, name] = formatted.split('#');
-						return stmt.bind(ipPort, name || null, p + i + 1);
-					})
-					.filter(Boolean);
-				if (batch.length) {
-					await saveTask(kv, taskId, 'running', `导入 ${batch.length} 条`);
-					await execBatches(db, batch);
-				}
-				await saveTask(kv, taskId, 'completed', `成功导入 ${batch.length} 条`);
-			} catch (e) {
-				await saveTask(kv, taskId, 'failed', e.message);
-				console.error('Import:', e);
-			}
-		};
-		if (ips.length > 50) {
-			ctx.waitUntil(importTask());
-			return json({ success: true, async: true, taskId, count: ips.length });
-		}
-		await importTask();
-		return json({ success: true, count: ips.length });
-	},
+    async addIp(db, { ip, priority }) {
+        if (!ip) return err('IP不能为空');
+        const formatted = formatIP(ip);
+        if (!formatted) return err('IP格式错误');
+        const { displayIp, port, name } = parseIP(formatted);
+        
+        let prio = priority;
+        // 如果未提供优先级，自动查询当前最大优先级并加1
+        if (prio === undefined || prio === null) {
+            const result = await db.prepare('SELECT COALESCE(MAX(priority), 0) + 1 as n FROM ips').first();
+            prio = result.n;
+        }
+        
+        // 使用 INSERT OR IGNORE 避免因重复 IP 导致错误
+        const { meta } = await db.prepare('INSERT OR IGNORE INTO ips(ip, name, active, priority) VALUES(?, ?, 1, ?)')
+            .bind(`${displayIp}:${port}`, name || null, prio).run();
 
-	async batchDelete(db, { ips }, ctx, kv) {
-		if (!Array.isArray(ips) || !ips.length) return err('列表为空');
-		const taskId = crypto.randomUUID();
-		const deleteTask = async () => {
-			try {
-				await saveTask(kv, taskId, 'running', '准备删除');
-				await execBatches(db, ips.map((ip) => db.prepare('DELETE FROM ips WHERE ip=?').bind(ip)));
-				await saveTask(kv, taskId, 'completed', `成功删除 ${ips.length} 条`);
-			} catch (e) {
-				await saveTask(kv, taskId, 'failed', e.message);
-				console.error('Delete:', e);
-			}
-		};
-		if (ips.length > 20) {
-			ctx.waitUntil(deleteTask());
-			return json({ success: true, async: true, taskId, count: ips.length });
-		}
-		await deleteTask();
-		return json({ success: true, count: ips.length });
-	},
+        if (meta.changes === 0) return err('IP已存在');
+        return json({ success: true });
+    },
 
-	async sortIps(db, ctx, kv) {
-		const taskId = crypto.randomUUID();
-		ctx.waitUntil(
-			(async () => {
-				try {
-					await saveTask(kv, taskId, 'running', '查询数据');
-					const { results } = await db.prepare('SELECT id,ip,name,active,priority FROM ips').all();
-					await saveTask(kv, taskId, 'running', '排序中');
-					const sorted = sortByRegion(results.map((r) => ({ ...r, ...parseIP(r.ip), region: extractRegion(r.name || '') })));
-					const batch = [];
-					sorted.forEach((s, i) => batch.push(db.prepare('UPDATE ips SET id=? WHERE id=?').bind(-(i + 1), s.id)));
-					sorted.forEach((s, i) => batch.push(db.prepare('UPDATE ips SET id=? WHERE id=?').bind(i + 1, -(i + 1))));
-					await saveTask(kv, taskId, 'running', '更新数据库');
-					await execBatches(db, batch);
-					await saveTask(kv, taskId, 'completed', '排序完成');
-				} catch (e) {
-					await saveTask(kv, taskId, 'failed', e.message);
-					console.error('Sort:', e);
-				}
-			})()
-		);
-		return json({ success: true, async: true, taskId });
-	},
+    async batchImport(db, { ips }, ctx, kv) {
+        if (!Array.isArray(ips) || !ips.length) return err('列表为空');
+        const taskId = crypto.randomUUID();
+        const importTask = async () => {
+            try {
+                await saveTask(kv, taskId, 'running', '准备导入');
+                const { p } = await db.prepare('SELECT COALESCE(MAX(priority), 0) as p FROM ips').first();
+                const stmt = db.prepare('INSERT OR IGNORE INTO ips(ip, name, active, priority) VALUES(?, ?, 1, ?)');
+                const batch = ips.map((ip, i) => {
+                    const formatted = formatIP(ip);
+                    if (!formatted) return null; // 跳过无效格式
+                    const { displayIp, port, name } = parseIP(formatted);
+                    return stmt.bind(`${displayIp}:${port}`, name || null, p + i + 1);
+                }).filter(Boolean); // 过滤掉所有无效条目
 
-	async sortByPriority(db, ctx, kv) {
-		const taskId = crypto.randomUUID();
-		ctx.waitUntil(
-			(async () => {
-				try {
-					await saveTask(kv, taskId, 'running', '查询数据');
-					const { results } = await db.prepare('SELECT id,ip,name,active,priority FROM ips').all();
-					await saveTask(kv, taskId, 'running', '按优先级排序中');
-					const sorted = results.sort((a, b) => {
-						if (a.priority !== b.priority) return a.priority - b.priority;
-						return a.id - b.id;
-					});
-					const batch = [];
-					sorted.forEach((s, i) => batch.push(db.prepare('UPDATE ips SET id=? WHERE id=?').bind(-(i + 1), s.id)));
-					sorted.forEach((s, i) => batch.push(db.prepare('UPDATE ips SET id=? WHERE id=?').bind(i + 1, -(i + 1))));
-					await saveTask(kv, taskId, 'running', '更新数据库');
-					await execBatches(db, batch);
-					await saveTask(kv, taskId, 'completed', '按优先级排序完成');
-				} catch (e) {
-					await saveTask(kv, taskId, 'failed', e.message);
-					console.error('Sort by priority:', e);
-				}
-			})()
-		);
-		return json({ success: true, async: true, taskId });
-	},
+                if (batch.length) {
+                    await saveTask(kv, taskId, 'running', `正在导入 ${batch.length} 条数据...`);
+                    await execBatches(db, batch);
+                }
+                await saveTask(kv, taskId, 'completed', `成功导入 ${batch.length} 条数据`);
+            } catch (e) {
+                await saveTask(kv, taskId, 'failed', e.message);
+                console.error('Import Error:', e);
+            }
+        };
+        ctx.waitUntil(importTask()); // 让任务在后台运行
+        return json({ success: true, async: true, taskId, count: ips.length });
+    },
 
-	async removeDuplicates(db, ctx, kv) {
-		const taskId = crypto.randomUUID();
-		ctx.waitUntil(
-			(async () => {
-				try {
-					await saveTask(kv, taskId, 'running', '查找重复数据');
-					const { results } = await db.prepare('SELECT id, ip FROM ips').all();
-					
-					if (results.length === 0) {
-						await saveTask(kv, taskId, 'completed', '没有发现重复数据');
-						return;
-					}
+    async batchDelete(db, { ips }, ctx, kv) {
+        if (!Array.isArray(ips) || !ips.length) return err('列表为空');
+        const taskId = crypto.randomUUID();
+        const deleteTask = async () => {
+            try {
+                await saveTask(kv, taskId, 'running', '准备删除');
+                // 增强解析，支持从 VLESS 链接或裸 IP 中提取待删除项
+                const deleteIps = ips.map(line => {
+                    const match = line.match(VLESS_EXTRACT_REGEX);
+                    return match ? match[1] : formatIP(line)?.split('#')[0];
+                }).filter(Boolean);
 
-					// 根据纯IP地址分组（忽略端口）
-					const ipGroups = {};
-					results.forEach(row => {
-						const pureIP = extractPureIP(row.ip);
-						if (!ipGroups[pureIP]) {
-							ipGroups[pureIP] = [];
-						}
-						ipGroups[pureIP].push(row);
-					});
+                if (deleteIps.length) {
+                    await execBatches(db, deleteIps.map(ip => db.prepare('DELETE FROM ips WHERE ip=?').bind(ip)));
+                }
+                await saveTask(kv, taskId, 'completed', `成功删除 ${deleteIps.length} 条匹配的数据`);
+            } catch (e) {
+                await saveTask(kv, taskId, 'failed', e.message);
+                console.error('Delete Error:', e);
+            }
+        };
+        ctx.waitUntil(deleteTask());
+        return json({ success: true, async: true, taskId, count: ips.length });
+    },
 
-					// 找出重复的IP组
-					const duplicateGroups = Object.values(ipGroups).filter(group => group.length > 1);
-					
-					if (duplicateGroups.length === 0) {
-						await saveTask(kv, taskId, 'completed', '没有发现重复数据');
-						return;
-					}
+    // 这是一个复杂且有风险的操作。更安全的方法是更新一个专门的 'sort_order' 列。
+    // 但为了匹配原始意图，我们使用两步更新法（先更新为负数ID，再更新为正数ID）来避免主键冲突。
+    async _performSort(db, sortedIds) {
+        if (sortedIds.length === 0) return;
+        const tempUpdates = sortedIds.map((id, index) => db.prepare('UPDATE ips SET id = ? WHERE id = ?').bind(-(index + 1), id));
+        const finalUpdates = sortedIds.map((id, index) => db.prepare('UPDATE ips SET id = ? WHERE id = ?').bind(index + 1, -(index + 1)));
+        
+        await execBatches(db, tempUpdates);
+        await execBatches(db, finalUpdates);
+    },
 
-					await saveTask(kv, taskId, 'running', `发现 ${duplicateGroups.length} 组重复IP，正在清理`);
-					
-					const batch = [];
-					let totalDuplicates = 0;
-					
-					for (const group of duplicateGroups) {
-						// 按ID排序，保留第一个（最早的）记录，删除其他重复项
-						group.sort((a, b) => a.id - b.id);
-						const keepId = group[0].id;
-						const deleteIds = group.slice(1).map(item => item.id);
-						
-						totalDuplicates += deleteIds.length;
-						
-						for (const deleteId of deleteIds) {
-							batch.push(db.prepare('DELETE FROM ips WHERE id=?').bind(deleteId));
-						}
-					}
+    async sortIps(db, ctx, kv) {
+        const taskId = crypto.randomUUID();
+        ctx.waitUntil(
+            (async () => {
+                try {
+                    await saveTask(kv, taskId, 'running', '查询数据');
+                    const { results } = await db.prepare('SELECT id, ip, name, priority FROM ips').all();
+                    await saveTask(kv, taskId, 'running', '排序中');
+                    const parsed = results.map(r => ({ ...r, ...parseIP(r.ip), region: extractRegion(r.name) }));
+                    const sorted = sortByRegion(parsed);
+                    await saveTask(kv, taskId, 'running', '更新数据库');
+                    await api._performSort(db, sorted.map(s => s.id));
+                    await saveTask(kv, taskId, 'completed', '排序完成');
+                } catch (e) {
+                    await saveTask(kv, taskId, 'failed', e.message);
+                    console.error('Sort Error:', e);
+                }
+            })()
+        );
+        return json({ success: true, async: true, taskId });
+    },
+    
+    async sortByPriority(db, ctx, kv) {
+        const taskId = crypto.randomUUID();
+        ctx.waitUntil(
+            (async () => {
+                try {
+                    await saveTask(kv, taskId, 'running', '查询数据');
+                    const { results } = await db.prepare('SELECT id, priority FROM ips').all();
+                    await saveTask(kv, taskId, 'running', '排序中');
+                    results.sort((a,b) => a.priority - b.priority || a.id - b.id);
+                    await saveTask(kv, taskId, 'running', '更新数据库');
+                    await api._performSort(db, results.map(r => r.id));
+                    await saveTask(kv, taskId, 'completed', '按优先级排序完成');
+                } catch (e) {
+                    await saveTask(kv, taskId, 'failed', e.message);
+                    console.error('Sort by Priority Error:', e);
+                }
+            })()
+        );
+        return json({ success: true, async: true, taskId });
+    },
+    
+    async removeDuplicates(db, ctx, kv) {
+        const taskId = crypto.randomUUID();
+        ctx.waitUntil(
+            (async () => {
+                try {
+                    await saveTask(kv, taskId, 'running', '查找重复项');
+                    // 这个 SQL 查询比将所有行取到 JS 中处理要高效得多。
+                    const { results } = await db.prepare("SELECT GROUP_CONCAT(id, ',') as ids FROM ips GROUP BY SUBSTR(ip, 1, INSTR(ip, ':') - 1) HAVING COUNT(id) > 1").all();
+                    
+                    if (results.length === 0) {
+                        await saveTask(kv, taskId, 'completed', '没有发现重复数据');
+                        return;
+                    }
 
-					if (batch.length > 0) {
-						await execBatches(db, batch);
-						await saveTask(kv, taskId, 'completed', `成功删除 ${totalDuplicates} 条重复数据，保留 ${duplicateGroups.length} 个唯一IP`);
-					} else {
-						await saveTask(kv, taskId, 'completed', '重复数据清理完成');
-					}
-				} catch (e) {
-					await saveTask(kv, taskId, 'failed', e.message);
-					console.error('Remove duplicates:', e);
-				}
-			})()
-		);
-		return json({ success: true, async: true, taskId });
-	},
+                    // 保留 ID 最小的那个，删除其余的。
+                    const deleteIds = results.flatMap(r => 
+                        r.ids.split(',').map(Number).sort((a,b) => a-b).slice(1)
+                    );
 
-	async reorderPriority(db, ctx, kv) {
-		const taskId = crypto.randomUUID();
-		ctx.waitUntil(
-			(async () => {
-				try {
-					await saveTask(kv, taskId, 'running', '查询数据');
-					const { results } = await db.prepare('SELECT id,ip,name,active,priority FROM ips ORDER BY id').all();
-					await saveTask(kv, taskId, 'running', '分组处理');
-					const processed = results.map((r) => ({ ...r, ...parseIP(r.ip), region: extractRegion(r.name || '') }));
-					const grouped = {};
-					processed.forEach((ip) => {
-						const reg = ip.region || 'OTHER';
-						if (!grouped[reg]) grouped[reg] = [];
-						grouped[reg].push(ip);
-					});
-					let prio = 1;
-					const batch = Object.keys(grouped)
-						.sort((a, b) => {
-							const ai = a === 'OTHER' ? REGIONS.length : REGIONS.indexOf(a);
-							const bi = b === 'OTHER' ? REGIONS.length : REGIONS.indexOf(b);
-							return ai - bi;
-						})
-						.flatMap((reg) =>
-							grouped[reg]
-								.sort((a, b) => a.id - b.id)
-								.map((ip) => db.prepare('UPDATE ips SET priority=? WHERE id=?').bind(prio++, ip.id))
-						);
-					await saveTask(kv, taskId, 'running', '更新优先级');
-					await execBatches(db, batch);
-					await saveTask(kv, taskId, 'completed', '优先级调整完成');
-				} catch (e) {
-					await saveTask(kv, taskId, 'failed', e.message);
-					console.error('Reorder:', e);
-				}
-			})()
-		);
-		return json({ success: true, async: true, taskId });
-	},
+                    if (deleteIds.length > 0) {
+                        await saveTask(kv, taskId, 'running', `正在删除 ${deleteIds.length} 条重复数据...`);
+                        const batch = deleteIds.map(id => db.prepare('DELETE FROM ips WHERE id = ?').bind(id));
+                        await execBatches(db, batch);
+                        await saveTask(kv, taskId, 'completed', `成功删除 ${deleteIds.length} 条重复数据`);
+                    } else {
+                        await saveTask(kv, taskId, 'completed', '重复数据清理完成');
+                    }
+                } catch (e) {
+                    await saveTask(kv, taskId, 'failed', e.message);
+                    console.error('Remove Duplicates Error:', e);
+                }
+            })()
+        );
+        return json({ success: true, async: true, taskId });
+    },
+    
+    async reorderPriority(db, ctx, kv) {
+        const taskId = crypto.randomUUID();
+        ctx.waitUntil(
+            (async () => {
+                try {
+                    await saveTask(kv, taskId, 'running', '查询数据');
+                    const { results } = await db.prepare('SELECT id, name FROM ips ORDER BY id').all();
+                    
+                    const parsed = results.map(r => ({ ...r, region: extractRegion(r.name) }));
+                    const REGION_ORDER = new Map(REGIONS.map((r, i) => [r, i]));
+                    const UNKNOWN_REGION_INDEX = REGIONS.length;
+                    
+                    parsed.sort((a,b) => {
+                        const ai = a.region ? (REGION_ORDER.get(a.region) ?? UNKNOWN_REGION_INDEX) : UNKNOWN_REGION_INDEX;
+                        const bi = b.region ? (REGION_ORDER.get(b.region) ?? UNKNOWN_REGION_INDEX) : UNKNOWN_REGION_INDEX;
+                        return ai - bi || a.id - b.id;
+                    });
 
-	async toggleAll(db, { active }, ctx, kv) {
-		const taskId = crypto.randomUUID();
-		ctx.waitUntil(
-			(async () => {
-				try {
-					await saveTask(kv, taskId, 'running', '更新中');
-					await db.prepare('UPDATE ips SET active=?').bind(active).run();
-					await saveTask(kv, taskId, 'completed', '更新完成');
-				} catch (e) {
-					await saveTask(kv, taskId, 'failed', e.message);
-					console.error('Toggle:', e);
-				}
-			})()
-		);
-		return json({ success: true, async: true, taskId });
-	},
+                    await saveTask(kv, taskId, 'running', '更新优先级');
+                    const batch = parsed.map((r, i) => db.prepare('UPDATE ips SET priority = ? WHERE id = ?').bind(i + 1, r.id));
+                    await execBatches(db, batch);
+                    await saveTask(kv, taskId, 'completed', '优先级调整完成');
+                } catch (e) {
+                    await saveTask(kv, taskId, 'failed', e.message);
+                    console.error('Reorder Priority Error:', e);
+                }
+            })()
+        );
+        return json({ success: true, async: true, taskId });
+    },
 
-	async clearAll(db, ctx, kv) {
-		const taskId = crypto.randomUUID();
-		ctx.waitUntil(
-			(async () => {
-				try {
-					await saveTask(kv, taskId, 'running', '清空中');
-					await db.prepare('DELETE FROM ips').run();
-					await saveTask(kv, taskId, 'completed', '清空完成');
-				} catch (e) {
-					await saveTask(kv, taskId, 'failed', e.message);
-					console.error('Clear:', e);
-				}
-			})()
-		);
-		return json({ success: true, async: true, taskId });
-	},
+    async toggleAll(db, { active }, ctx, kv) {
+        const taskId = crypto.randomUUID();
+        ctx.waitUntil(
+            (async () => {
+                try {
+                    await saveTask(kv, taskId, 'running', '更新中');
+                    await db.prepare('UPDATE ips SET active = ?').bind(active ? 1 : 0).run();
+                    await saveTask(kv, taskId, 'completed', '更新完成');
+                } catch (e) {
+                    await saveTask(kv, taskId, 'failed', e.message);
+                    console.error('Toggle All Error:', e);
+                }
+            })()
+        );
+        return json({ success: true, async: true, taskId });
+    },
 
-	async updateIp(db, id, body) {
-		const updates = [],
-			binds = [];
-		if ('active' in body) {
-			updates.push('active=?');
-			binds.push(body.active);
-		}
-		if ('ip' in body) {
-			const formatted = formatIP(body.ip);
-			if (!formatted) return err('IP格式错误');
-			const [ipPort, name] = formatted.split('#');
-			updates.push('ip=?,name=?');
-			binds.push(ipPort, name || null);
-		}
-		if ('priority' in body) {
-			const newPriority = body.priority;
-			const [current, conflict] = await Promise.all([
-				db.prepare('SELECT priority FROM ips WHERE id=?').bind(id).first(),
-				db.prepare('SELECT id FROM ips WHERE priority=? AND id!=?').bind(newPriority, id).first(),
-			]);
-			if (conflict) {
-				await db.batch([
-					db.prepare('UPDATE ips SET priority=? WHERE id=?').bind(current.priority, conflict.id),
-					db.prepare('UPDATE ips SET priority=? WHERE id=?').bind(newPriority, id),
-				]);
-				return json({ success: true, swapped: true });
-			}
-			updates.push('priority=?');
-			binds.push(newPriority);
-		}
-		if (updates.length) {
-			binds.push(id);
-			await db.prepare(`UPDATE ips SET ${updates.join(',')} WHERE id=?`).bind(...binds).run();
-		}
-		return json({ success: true });
-	},
+    async clearAll(db, ctx, kv) {
+        const taskId = crypto.randomUUID();
+        ctx.waitUntil(
+            (async () => {
+                try {
+                    await saveTask(kv, taskId, 'running', '清空中');
+                    await db.prepare('DELETE FROM ips').run();
+                    await saveTask(kv, taskId, 'completed', '清空完成');
+                } catch (e) {
+                    await saveTask(kv, taskId, 'failed', e.message);
+                    console.error('Clear All Error:', e);
+                }
+            })()
+        );
+        return json({ success: true, async: true, taskId });
+    },
 
-	async deleteIp(db, id) {
-		await db.prepare('DELETE FROM ips WHERE id=?').bind(id).run();
-		return json({ success: true });
-	},
+    async updateIp(db, id, body) {
+        const { active, ip, priority } = body;
+        
+        if (ip !== undefined) {
+            const formatted = formatIP(ip);
+            if (!formatted) return err('IP格式错误');
+            const { displayIp, port, name } = parseIP(formatted);
+            await db.prepare('UPDATE ips SET ip=?, name=? WHERE id=?').bind(`${displayIp}:${port}`, name || null, id).run();
+        }
+        if (active !== undefined) {
+            await db.prepare('UPDATE ips SET active=? WHERE id=?').bind(active ? 1 : 0, id).run();
+        }
+        if (priority !== undefined) {
+            // 原子性地交换优先级，以避免唯一约束冲突
+            const { current_priority } = await db.prepare('SELECT priority as current_priority FROM ips WHERE id=?').bind(id).first();
+            await db.batch([
+                db.prepare('UPDATE ips SET priority = ? WHERE priority = ? AND id != ?').bind(current_priority, priority, id),
+                db.prepare('UPDATE ips SET priority = ? WHERE id = ?').bind(priority, id)
+            ]);
+        }
+        
+        return json({ success: true });
+    },
 
-	async initDb(db) {
-		await db.batch([
-			db.prepare('CREATE TABLE IF NOT EXISTS ips(id INTEGER PRIMARY KEY AUTOINCREMENT,ip TEXT UNIQUE NOT NULL,name TEXT,active INTEGER DEFAULT 1,priority INTEGER DEFAULT 0)'),
-			db.prepare('CREATE UNIQUE INDEX IF NOT EXISTS idx_ips_ip ON ips(ip)'),
-			db.prepare('CREATE INDEX IF NOT EXISTS idx_ips_active ON ips(active)'),
-			db.prepare('CREATE INDEX IF NOT EXISTS idx_ips_priority ON ips(priority)'),
-		]);
-		return json({ success: true });
-	},
+    async deleteIp(db, id) {
+        await db.prepare('DELETE FROM ips WHERE id=?').bind(id).run();
+        return json({ success: true });
+    },
+
+    async initDb(db) {
+        await db.batch([
+            db.prepare('CREATE TABLE IF NOT EXISTS ips(id INTEGER PRIMARY KEY, ip TEXT UNIQUE NOT NULL, name TEXT, active INTEGER DEFAULT 1, priority INTEGER DEFAULT 0)'),
+            db.prepare('CREATE UNIQUE INDEX IF NOT EXISTS idx_ips_ip ON ips(ip)'),
+            db.prepare('CREATE INDEX IF NOT EXISTS idx_ips_active ON ips(active)'),
+            db.prepare('CREATE INDEX IF NOT EXISTS idx_ips_priority ON ips(priority)'),
+        ]);
+        return json({ success: true });
+    },
 };
 
-const route = async (path, method, db, body, params, ctx, kv) => {
-	try {
-		if (path === '/ips' && method === 'GET') return api.getIps(db, params);
-		if (path === '/ips/stats' && method === 'GET') return api.getStats(db);
-		if (path === '/ips' && method === 'POST') return api.addIp(db, body);
-		if (path === '/ips/batch' && method === 'POST') return api.batchImport(db, body, ctx, kv);
-		if (path === '/ips/batch-delete' && method === 'POST') return api.batchDelete(db, body, ctx, kv);
-		if (path === '/ips/sort' && method === 'POST') return api.sortIps(db, ctx, kv);
-		if (path === '/ips/sort-priority' && method === 'POST') return api.sortByPriority(db, ctx, kv);
-		if (path === '/ips/remove-duplicates' && method === 'POST') return api.removeDuplicates(db, ctx, kv);
-		if (path === '/ips/reorder-priority' && method === 'POST') return api.reorderPriority(db, ctx, kv);
-		if (path === '/ips/toggle-all' && method === 'POST') return api.toggleAll(db, body, ctx, kv);
-		if (path === '/ips/clear' && method === 'DELETE') return api.clearAll(db, ctx, kv);
-		if (path === '/init' && method === 'POST') return api.initDb(db);
-		const taskMatch = path.match(/^\/task\/([a-f0-9-]+)$/);
-		if (taskMatch && method === 'GET') return api.getTaskStatus(kv, taskMatch[1]);
-		const idMatch = path.match(/^\/ips\/(\d+)$/);
-		if (idMatch) {
-			if (method === 'PUT') return api.updateIp(db, idMatch[1], body);
-			if (method === 'DELETE') return api.deleteIp(db, idMatch[1]);
-		}
-		return new Response(null, { status: 404 });
-	} catch (e) {
-		console.error(e);
-		return err(e.message, 500);
-	}
+// --- 路由分发器 (修正版) ---
+const route = (req, db, ctx, kv) => {
+    const url = new URL(req.url);
+    // 关键修复：在路由匹配前，移除 '/api' 前缀
+    const apiPath = url.pathname.slice(4);
+    const method = req.method;
+
+    const handle = async () => {
+        const body = (method === 'POST' || method === 'PUT') ? await req.json().catch(() => ({})) : {};
+        
+        // 静态路由表
+        const routes = {
+            '/ips': { GET: () => api.getIps(db, url.searchParams), POST: () => api.addIp(db, body) },
+            '/ips/stats': { GET: () => api.getStats(db) },
+            '/ips/batch': { POST: () => api.batchImport(db, body, ctx, kv) },
+            '/ips/batch-delete': { POST: () => api.batchDelete(db, body, ctx, kv) },
+            '/ips/sort': { POST: () => api.sortIps(db, ctx, kv) },
+            '/ips/sort-priority': { POST: () => api.sortByPriority(db, ctx, kv) },
+            '/ips/remove-duplicates': { POST: () => api.removeDuplicates(db, ctx, kv) },
+            '/ips/reorder-priority': { POST: () => api.reorderPriority(db, ctx, kv) },
+            '/ips/toggle-all': { POST: () => api.toggleAll(db, body, ctx, kv) },
+            '/ips/clear': { DELETE: () => api.clearAll(db, ctx, kv) },
+            '/init': { POST: () => api.initDb(db) },
+        };
+
+        if (routes[apiPath] && routes[apiPath][method]) {
+            return routes[apiPath][method]();
+        }
+
+        // 动态路由匹配
+        const taskMatch = apiPath.match(/^\/task\/([a-f0-9-]+)$/);
+        if (taskMatch && method === 'GET') return api.getTaskStatus(kv, taskMatch[1]);
+        
+        const idMatch = apiPath.match(/^\/ips\/(\d+)$/);
+        if (idMatch) {
+            if (method === 'PUT') return api.updateIp(db, idMatch[1], body);
+            if (method === 'DELETE') return api.deleteIp(db, idMatch[1]);
+        }
+        
+        return new Response('Not Found', { status: 404 });
+    };
+
+    return handle().catch(e => {
+        console.error(e);
+        return err(e.message, 500);
+    });
 };
 
 const getHTML = () => `<!DOCTYPE html>
@@ -1207,9 +1212,9 @@ const getHTML = () => `<!DOCTYPE html>
 		
 		<div class="actions">
 			<button onclick="loadIps()">刷新</button>
-			<button class="purple" onclick="sortByRegion()">地区排序</button>
-			<button class="purple" onclick="reorderPriority()">优先级调整</button>
-			<button class="purple" onclick="sortByPriority()">优先级排序</button>
+			<button class="purple" onclick="sortByRegion()">按地区排序</button>
+			<button class="purple" onclick="reorderPriority()">调整优先级</button>
+			<button class="purple" onclick="sortByPriority()">按优先级排序</button>
 			<button class="orange" onclick="removeDuplicates()">一键去重</button>
 			<button class="success" onclick="toggleAll(1)">全部启用</button>
 			<button class="secondary" onclick="toggleAll(0)">全部禁用</button>
@@ -1603,31 +1608,34 @@ loadIps();
 </body>
 </html>`;
 
+// --- 主 Fetch Handler ---
 export default {
-	async fetch(req, env, ctx) {
-		const url = new URL(req.url);
-		const { pathname, searchParams } = url;
+    async fetch(req, env, ctx) {
+        const url = new URL(req.url);
 
-		if (pathname === '/') return new Response(getHTML(), { headers: { 'Content-Type': 'text/html;charset=utf-8' } });
+        if (url.pathname === '/') {
+            return new Response(getHTML(), { headers: { 'Content-Type': 'text/html;charset=utf-8' } });
+        }
 
-		if (pathname === '/Vless') {
-			const host = searchParams.get('host') || HOST;
-			const cacheKey = new Request(url, req);
-			const cache = caches.default;
-			let res = await cache.match(cacheKey);
-			if (res) return res;
-			const { results } = await env.DB.prepare('SELECT ip,name FROM ips WHERE active=1 ORDER BY priority,id LIMIT ?').bind(MAX_VLESS).all();
-			const links = results.map((ip) => generateVless(ip, host)).join('\n');
-			res = new Response(links || '暂无节点', { headers: { 'Content-Type': 'text/plain;charset=utf-8', 'Cache-Control': 'public,max-age=60' } });
-			ctx.waitUntil(cache.put(cacheKey, res.clone()).catch(() => {}));
-			return res;
-		}
+        if (url.pathname === '/Vless') {
+            const host = url.searchParams.get('host') || HOST;
+            const cacheKey = new Request(req.url, req);
+            const cache = caches.default;
+            let res = await cache.match(cacheKey);
+            if (res) return res;
 
-		if (pathname.startsWith('/api')) {
-			const body = req.method !== 'GET' && req.method !== 'DELETE' ? await req.json().catch(() => ({})) : {};
-			return route(pathname.slice(4), req.method, env.DB, body, searchParams, ctx, env.TASK_KV);
-		}
+            const { results } = await env.DB.prepare('SELECT ip, name FROM ips WHERE active=1 ORDER BY priority, id LIMIT ?').bind(MAX_VLESS).all();
+            const links = results.map((ip) => generateVless(ip, host)).join('\n');
+            
+            res = new Response(links || '暂无节点', { headers: { 'Content-Type': 'text/plain;charset=utf-8', 'Cache-Control': 'public, max-age=60' } });
+            ctx.waitUntil(cache.put(cacheKey, res.clone()));
+            return res;
+        }
 
-		return new Response(null, { status: 404 });
-	},
+        if (url.pathname.startsWith('/api/')) {
+            return route(req, env.DB, ctx, env.TASK_KV);
+        }
+
+        return new Response('Not Found', { status: 404 });
+    },
 };
