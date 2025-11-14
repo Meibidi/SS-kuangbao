@@ -3,24 +3,20 @@ const UUID = '';
 const HOST = ''; // 默认的 VLESS host
 const REGIONS = ['HK', 'TW', 'JP', 'SG', 'KR', 'US']; // 地区排序优先级
 const PAGE_SIZE = 30; // 分页大小
-const BATCH_SIZE = 50; // D1 数据库批量操作大小，50 是一个安全值
+const BATCH_SIZE = 50; // D1 数据库批量操作大小
 const MAX_VLESS = 500; // VLESS 订阅链接的最大节点数
 
 // --- 性能优化：预编译正则表达式 & 查找表 ---
-// 一个健壮的正则表达式，用于解析各种IP格式: [IPv6]:port#name, IPv4:port#name, domain:port#name
 const IP_FORMAT_REGEX = /^(\[[a-fA-F0-9:]+\]|[^:#\[\]]+)(?::(\d+))?(#.*)?$/;
-const VLESS_EXTRACT_REGEX = /@([^?:]+:[^?]+)\??/; // 从 VLESS 链接中提取 IP:Port
-// 预编译地区正则表达式，避免在循环中重复创建，这是显著的性能提升点。
+const VLESS_EXTRACT_REGEX = /@([^?:]+:[^?]+)\??/;
 const PRECOMPILED_REGION_REGEX = new Map(REGIONS.map(r => [r, new RegExp(r, 'i')]));
 
 // --- 工具函数 ---
 const json = (d, s = 200) => Response.json(d, { status: s });
 const err = (m, s = 400) => Response.json({ error: m }, { status: s });
 
-// 内存中的任务状态回退机制，以防 KV 写入失败或延迟
-const tasks = {};
+const tasks = {}; // 内存中的任务状态回退机制
 
-// 批量执行 D1 数据库语句，避免超出单次 batch 的限制
 const execBatches = async (db, statements) => {
     for (let i = 0; i < statements.length; i += BATCH_SIZE) {
         await db.batch(statements.slice(i, i + BATCH_SIZE));
@@ -28,20 +24,6 @@ const execBatches = async (db, statements) => {
 };
 
 // --- 经过优化的 IP 和地区解析函数 ---
-
-// 统一格式化 IP 输入，确保数据一致性
-const formatIP = (ip) => {
-    const t = ip.trim();
-    if (!t) return null;
-    const match = t.match(IP_FORMAT_REGEX);
-    if (!match) return null; // 格式无效
-
-    const [, ipPart, portPart, namePart] = match;
-    const port = portPart || '443'; // 默认端口为 443
-    return `${ipPart}:${port}${namePart || ''}`;
-};
-
-// 从格式化的 IP 字符串中解析出各个部分
 const parseIP = (ip) => {
     const match = ip.match(IP_FORMAT_REGEX);
     if (!match) return { displayIp: ip, port: 'N/A', name: '' };
@@ -50,17 +32,12 @@ const parseIP = (ip) => {
     return {
         displayIp: ipPart,
         port: portPart || '443',
-        name: (namePart || '').substring(1), // 移除前导 '#'
+        name: (namePart || '').substring(1),
     };
 };
 
-// 提取纯 IP 地址（不含端口和名称）
-const extractPureIP = (ip) => ip.match(IP_FORMAT_REGEX)?.[1] || ip;
-
-// 从节点名称中提取地区信息
 const extractRegion = (name) => {
     if (!name) return '';
-    // 使用预编译的正则表达式进行匹配，性能更高
     for (const [region, regex] of PRECOMPILED_REGION_REGEX.entries()) {
         if (regex.test(name)) return region;
     }
@@ -69,46 +46,41 @@ const extractRegion = (name) => {
 
 // --- 经过优化的排序函数 ---
 const sortByRegion = (ips) => {
-    // 创建地区排序的查找表 (Map)，比 indexOf 更快
     const REGION_ORDER = new Map(REGIONS.map((r, i) => [r, i]));
     const UNKNOWN_REGION_INDEX = REGIONS.length;
 
-    // 预先计算排序键，使得 sort 的比较函数极其快速。
-    // 将昂贵的计算（如提取地区）从 O(N log N) 降低到 O(N)。
     const sortableIps = ips.map(ip => ({
         ...ip,
         _regionIndex: ip.region ? (REGION_ORDER.get(ip.region) ?? UNKNOWN_REGION_INDEX) : UNKNOWN_REGION_INDEX,
-        _isV6: ip.displayIp.startsWith('[') ? 0 : 1, // IPv6 优先
+        _isV6: ip.ip.startsWith('[') ? 0 : 1,
     }));
 
-    // 执行排序，比较函数现在只进行简单的数字比较
     return sortableIps.sort((a, b) => 
-        a._regionIndex - b._regionIndex || // 按地区索引排序
-        a.priority - b.priority ||         // 按优先级排序
-        a._isV6 - b._isV6 ||               // 按 IP 版本排序 (v6在前)
-        a.id - b.id                        // 按原始 ID 排序作为最终保障
+        a._regionIndex - b._regionIndex ||
+        a.priority - b.priority ||
+        a._isV6 - b._isV6 ||
+        a.id - b.id
     );
 };
 
 // --- 其他工具函数 ---
-const generateVless = (ip, host) => {
-    const { displayIp, port, name } = parseIP(ip.ip);
+const generateVless = (dbIpRow, host) => {
+    const { displayIp, port } = parseIP(dbIpRow.ip);
+    const name = dbIpRow.name;
     const encodedName = name ? encodeURIComponent(name) : encodeURIComponent(`${displayIp.replace(/[\.\[\]:]/g, '-')}-${port}`);
     const effectiveHost = host || displayIp;
     return `vless://${UUID}@${displayIp}:${port}?encryption=none&security=tls&type=ws&host=${effectiveHost}&path=%2F%3Fed%3D2560&sni=${effectiveHost}#${encodedName}`;
 };
 
-// 保存异步任务状态，同时写入 KV 和内存
 const saveTask = async (kv, id, status, msg = '') => {
     const data = { status, message: msg, timestamp: Date.now() };
-    tasks[id] = data; // 内存回退
-    setTimeout(() => delete tasks[id], 300000); // 5分钟后清理内存中的任务
+    tasks[id] = data;
+    setTimeout(() => delete tasks[id], 300000);
     if (kv) {
         await kv.put(`task:${id}`, JSON.stringify(data), { expirationTtl: 300 }).catch(console.error);
     }
 };
 
-// 获取异步任务状态，优先从内存读取
 const getTask = async (kv, id) => {
     if (tasks[id]) return tasks[id];
     if (kv) {
@@ -120,7 +92,7 @@ const getTask = async (kv, id) => {
     return null;
 };
 
-// --- API 实现 (优化版) ---
+// --- API 实现 (最终修正优化版) ---
 const api = {
     async getIps(db, params) {
         const page = parseInt(params.get('page') || '1');
@@ -129,18 +101,22 @@ const api = {
 
         const baseQuery = db.prepare('SELECT id, ip, name, active, priority FROM ips ORDER BY id LIMIT ? OFFSET ?').bind(limit, offset);
         
-        // 如果前端不需要总页数，则不执行 COUNT 查询，以提高性能
         if (params.get('needTotal') !== 'true') {
             const { results } = await baseQuery.all();
-            const ips = results.map(r => ({ ...r, ...parseIP(r.ip), region: extractRegion(r.name) }));
+            const ips = results.map(r => {
+                const { displayIp, port } = parseIP(r.ip);
+                return { ...r, displayIp, port, region: extractRegion(r.name) };
+            });
             return json({ ips, pagination: { page, limit } });
         }
 
-        // 使用 db.batch 一次性执行两个查询，效率更高
         const countQuery = db.prepare('SELECT COUNT(*) as total FROM ips');
         const [data, totalResult] = await db.batch([baseQuery, countQuery]);
         
-        const ips = data.results.map(r => ({ ...r, ...parseIP(r.ip), region: extractRegion(r.name) }));
+        const ips = data.results.map(r => {
+            const { displayIp, port } = parseIP(r.ip);
+            return { ...r, displayIp, port, region: extractRegion(r.name) };
+        });
         const total = totalResult.results[0].total;
 
         return json({
@@ -150,7 +126,6 @@ const api = {
     },
 
     async getStats(db) {
-        // 使用 SUM(active) 比 SUM(CASE...) 更简洁高效
         const { total, active } = await db.prepare('SELECT COUNT(*) as total, SUM(active) as active FROM ips').first();
         return json({ total, active: active || 0, inactive: total - (active || 0) });
     },
@@ -163,18 +138,15 @@ const api = {
 
     async addIp(db, { ip, priority }) {
         if (!ip) return err('IP不能为空');
-        const formatted = formatIP(ip);
-        if (!formatted) return err('IP格式错误');
-        const { displayIp, port, name } = parseIP(formatted);
+        const { displayIp, port, name } = parseIP(ip);
+        if (port === 'N/A') return err('IP格式错误');
         
         let prio = priority;
-        // 如果未提供优先级，自动查询当前最大优先级并加1
         if (prio === undefined || prio === null) {
             const result = await db.prepare('SELECT COALESCE(MAX(priority), 0) + 1 as n FROM ips').first();
             prio = result.n;
         }
         
-        // 使用 INSERT OR IGNORE 避免因重复 IP 导致错误
         const { meta } = await db.prepare('INSERT OR IGNORE INTO ips(ip, name, active, priority) VALUES(?, ?, 1, ?)')
             .bind(`${displayIp}:${port}`, name || null, prio).run();
 
@@ -191,11 +163,10 @@ const api = {
                 const { p } = await db.prepare('SELECT COALESCE(MAX(priority), 0) as p FROM ips').first();
                 const stmt = db.prepare('INSERT OR IGNORE INTO ips(ip, name, active, priority) VALUES(?, ?, 1, ?)');
                 const batch = ips.map((ip, i) => {
-                    const formatted = formatIP(ip);
-                    if (!formatted) return null; // 跳过无效格式
-                    const { displayIp, port, name } = parseIP(formatted);
+                    const { displayIp, port, name } = parseIP(ip);
+                    if (port === 'N/A') return null;
                     return stmt.bind(`${displayIp}:${port}`, name || null, p + i + 1);
-                }).filter(Boolean); // 过滤掉所有无效条目
+                }).filter(Boolean);
 
                 if (batch.length) {
                     await saveTask(kv, taskId, 'running', `正在导入 ${batch.length} 条数据...`);
@@ -207,7 +178,7 @@ const api = {
                 console.error('Import Error:', e);
             }
         };
-        ctx.waitUntil(importTask()); // 让任务在后台运行
+        ctx.waitUntil(importTask());
         return json({ success: true, async: true, taskId, count: ips.length });
     },
 
@@ -217,10 +188,11 @@ const api = {
         const deleteTask = async () => {
             try {
                 await saveTask(kv, taskId, 'running', '准备删除');
-                // 增强解析，支持从 VLESS 链接或裸 IP 中提取待删除项
                 const deleteIps = ips.map(line => {
                     const match = line.match(VLESS_EXTRACT_REGEX);
-                    return match ? match[1] : formatIP(line)?.split('#')[0];
+                    if (match) return match[1];
+                    const { displayIp, port } = parseIP(line);
+                    return port === 'N/A' ? null : `${displayIp}:${port}`;
                 }).filter(Boolean);
 
                 if (deleteIps.length) {
@@ -236,8 +208,6 @@ const api = {
         return json({ success: true, async: true, taskId, count: ips.length });
     },
 
-    // 这是一个复杂且有风险的操作。更安全的方法是更新一个专门的 'sort_order' 列。
-    // 但为了匹配原始意图，我们使用两步更新法（先更新为负数ID，再更新为正数ID）来避免主键冲突。
     async _performSort(db, sortedIds) {
         if (sortedIds.length === 0) return;
         const tempUpdates = sortedIds.map((id, index) => db.prepare('UPDATE ips SET id = ? WHERE id = ?').bind(-(index + 1), id));
@@ -255,7 +225,7 @@ const api = {
                     await saveTask(kv, taskId, 'running', '查询数据');
                     const { results } = await db.prepare('SELECT id, ip, name, priority FROM ips').all();
                     await saveTask(kv, taskId, 'running', '排序中');
-                    const parsed = results.map(r => ({ ...r, ...parseIP(r.ip), region: extractRegion(r.name) }));
+                    const parsed = results.map(r => ({ ...r, region: extractRegion(r.name) }));
                     const sorted = sortByRegion(parsed);
                     await saveTask(kv, taskId, 'running', '更新数据库');
                     await api._performSort(db, sorted.map(s => s.id));
@@ -296,15 +266,13 @@ const api = {
             (async () => {
                 try {
                     await saveTask(kv, taskId, 'running', '查找重复项');
-                    // 这个 SQL 查询比将所有行取到 JS 中处理要高效得多。
                     const { results } = await db.prepare("SELECT GROUP_CONCAT(id, ',') as ids FROM ips GROUP BY SUBSTR(ip, 1, INSTR(ip, ':') - 1) HAVING COUNT(id) > 1").all();
                     
                     if (results.length === 0) {
                         await saveTask(kv, taskId, 'completed', '没有发现重复数据');
                         return;
                     }
-
-                    // 保留 ID 最小的那个，删除其余的。
+                    
                     const deleteIds = results.flatMap(r => 
                         r.ids.split(',').map(Number).sort((a,b) => a-b).slice(1)
                     );
@@ -395,16 +363,14 @@ const api = {
         const { active, ip, priority } = body;
         
         if (ip !== undefined) {
-            const formatted = formatIP(ip);
-            if (!formatted) return err('IP格式错误');
-            const { displayIp, port, name } = parseIP(formatted);
+            const { displayIp, port, name } = parseIP(ip);
+            if (port === 'N/A') return err('IP格式错误');
             await db.prepare('UPDATE ips SET ip=?, name=? WHERE id=?').bind(`${displayIp}:${port}`, name || null, id).run();
         }
         if (active !== undefined) {
             await db.prepare('UPDATE ips SET active=? WHERE id=?').bind(active ? 1 : 0, id).run();
         }
         if (priority !== undefined) {
-            // 原子性地交换优先级，以避免唯一约束冲突
             const { current_priority } = await db.prepare('SELECT priority as current_priority FROM ips WHERE id=?').bind(id).first();
             await db.batch([
                 db.prepare('UPDATE ips SET priority = ? WHERE priority = ? AND id != ?').bind(current_priority, priority, id),
@@ -431,17 +397,15 @@ const api = {
     },
 };
 
-// --- 路由分发器 (修正版) ---
+// --- 路由分发器 (最终修正版) ---
 const route = (req, db, ctx, kv) => {
     const url = new URL(req.url);
-    // 关键修复：在路由匹配前，移除 '/api' 前缀
     const apiPath = url.pathname.slice(4);
     const method = req.method;
 
     const handle = async () => {
         const body = (method === 'POST' || method === 'PUT') ? await req.json().catch(() => ({})) : {};
         
-        // 静态路由表
         const routes = {
             '/ips': { GET: () => api.getIps(db, url.searchParams), POST: () => api.addIp(db, body) },
             '/ips/stats': { GET: () => api.getStats(db) },
@@ -460,7 +424,6 @@ const route = (req, db, ctx, kv) => {
             return routes[apiPath][method]();
         }
 
-        // 动态路由匹配
         const taskMatch = apiPath.match(/^\/task\/([a-f0-9-]+)$/);
         if (taskMatch && method === 'GET') return api.getTaskStatus(kv, taskMatch[1]);
         
@@ -1625,7 +1588,7 @@ export default {
             if (res) return res;
 
             const { results } = await env.DB.prepare('SELECT ip, name FROM ips WHERE active=1 ORDER BY priority, id LIMIT ?').bind(MAX_VLESS).all();
-            const links = results.map((ip) => generateVless(ip, host)).join('\n');
+            const links = results.map((ipRow) => generateVless(ipRow, host)).join('\n');
             
             res = new Response(links || '暂无节点', { headers: { 'Content-Type': 'text/plain;charset=utf-8', 'Cache-Control': 'public, max-age=60' } });
             ctx.waitUntil(cache.put(cacheKey, res.clone()));
