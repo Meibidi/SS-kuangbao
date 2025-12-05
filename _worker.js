@@ -1,5 +1,5 @@
 import{connect as C}from'cloudflare:sockets'
-const U=new Uint8Array([207,164,66,231,10,98,92,23,153,27,78,44,147,137,198,95]),M=new Uint8Array(32768),P=[],D=new TextDecoder,H=new Uint8Array(2),
+const U=new Uint8Array([207,164,66,231,10,98,92,23,153,27,78,44,147,137,198,95]),M=new Uint8Array(32768),P=[],D=new TextDecoder,
 A=s=>{const o=19+s[17],p=s[o]<<8|s[o+1],b=o+3,y=s[o+2]===1,n=s[b],i=b+1;return[y?s[b]+'.'+s[i]+'.'+s[i+1]+'.'+s[i+2]:D.decode(s.subarray(i,i+n)),p,y?b+4:i+n,s[0]]},
 B=async(h,p)=>{try{const s=C({hostname:h,port:p,keepAlive:true});await s.opened;return s}catch{return null}};
 let m=0
@@ -17,8 +17,7 @@ const{0:c,1:S}=new WebSocketPair,w=k.writable.getWriter();S.accept()
 let a=true;const T=()=>{if(!a)return;a=false;try{w.releaseLock()}catch{}try{k.close()}catch{}try{S.close(1006)}catch{}}
 if(n>z)w.write(s.subarray(z)).catch(T)
 F()
-S.addEventListener('message',e=>{if(a)w.write(e.data).catch(T)})
-S.addEventListener('close',T);S.addEventListener('error',T)
-let f=true;k.readable.pipeTo(new WritableStream({write(d){if(!a)return;if(f){f=false;H[0]=v;const o=new Uint8Array(d.length+2);o.set(H);o.set(new Uint8Array(d),2);S.send(o)}else S.send(d)},close:T,abort:T})).catch(T)
+const E=e=>{if(a)w.write(e.data).catch(T)};S.addEventListener('message',E);S.addEventListener('close',T);S.addEventListener('error',T)
+let f=true;k.readable.pipeTo(new WritableStream({write(b){if(!a)return;const u=new Uint8Array(b);if(f){f=false;const o=new Uint8Array(u.length+2);o[0]=v;o.set(u,2);S.send(o)}else S.send(u)},close:T,abort:T})).catch(T)
 return new Response(null,{status:101,webSocket:c})
 }}
