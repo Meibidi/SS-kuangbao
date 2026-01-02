@@ -1,391 +1,539 @@
 // --- 全局配置 ---
 const UUID = '';
-const HOST = ''; // 默认的 VLESS host
-const REGIONS = ['HK', 'TW', 'JP', 'SG', 'KR', 'US']; // 地区排序优先级
-const PAGE_SIZE = 30; // 分页大小
-const BATCH_SIZE = 50; // D1 数据库批量操作大小
-const MAX_VLESS = 500; // VLESS 订阅链接的最大节点数
+const HOST = '';
+const REGIONS = [
+  'HK',
+  '香港',
+  'TW',
+  '台湾',
+  'JP',
+  '日本',
+  'SG',
+  '新加坡',
+  'KR',
+  '韩国',
+  'US',
+  '美国'
+];
+const PAGE_SIZE = 30;
+const BATCH_SIZE = 50;
+const MAX_VLESS = 500;
+const CACHE_TTL = 60; // 缓存 TTL（秒）
+const STATS_CACHE_KEY = 'cache:stats';
+const TASK_TTL = 300; // 任务状态 TTL（秒）
 
-// --- 性能优化：预编译正则表达式 & 查找表 ---
+// --- 预编译正则 & 查找表 ---
 const IP_FORMAT_REGEX = /^(\[[a-fA-F0-9:]+\]|[^:#\[\]]+)(?::(\d+))?(#.*)?$/;
 const VLESS_EXTRACT_REGEX = /@([^?:]+:[^?]+)\??/;
-const PRECOMPILED_REGION_REGEX = new Map(REGIONS.map(r => [r, new RegExp(r, 'i')]));
+const REGION_ORDER = new Map(REGIONS.map((r, i) => [r, i]));
+const UNKNOWN_REGION_INDEX = REGIONS.length;
+
+// 预编译地区匹配正则 - 使用单一正则提升性能
+const REGION_PATTERNS = REGIONS.map(r => `(${r})`).join('|');
+const COMBINED_REGION_REGEX = new RegExp(REGION_PATTERNS, 'i');
 
 // --- 工具函数 ---
 const json = (d, s = 200) => Response.json(d, { status: s });
 const err = (m, s = 400) => Response.json({ error: m }, { status: s });
 
-const tasks = {}; // 内存中的任务状态回退机制
+// 内存任务缓存（作为 KV 的回退）
+const taskCache = new Map();
 
-const execBatches = async (db, statements) => {
-    for (let i = 0; i < statements.length; i += BATCH_SIZE) {
-        await db.batch(statements.slice(i, i + BATCH_SIZE));
-    }
-};
-
-// --- 经过优化的 IP 和地区解析函数 ---
+// --- 核心工具函数 ---
 const parseIP = (ip) => {
     const match = ip.match(IP_FORMAT_REGEX);
     if (!match) return { displayIp: ip, port: 'N/A', name: '' };
-    
-    const [, ipPart, portPart, namePart] = match;
     return {
-        displayIp: ipPart,
-        port: portPart || '443',
-        name: (namePart || '').substring(1),
+        displayIp: match[1],
+        port: match[2] || '443',
+        name: (match[3] || '').slice(1),
     };
 };
 
 const extractRegion = (name) => {
     if (!name) return '';
-    for (const [region, regex] of PRECOMPILED_REGION_REGEX.entries()) {
-        if (regex.test(name)) return region;
+    const match = name.match(COMBINED_REGION_REGEX);
+    return match ? match[0].toUpperCase() : '';
+};
+
+const getRegionIndex = (region) => region ? (REGION_ORDER.get(region) ?? UNKNOWN_REGION_INDEX) : UNKNOWN_REGION_INDEX;
+
+// --- 批量执行优化 ---
+const execBatches = async (db, statements) => {
+    const len = statements.length;
+    if (len === 0) return;
+    if (len <= BATCH_SIZE) {
+        await db.batch(statements);
+        return;
     }
-    return '';
+    for (let i = 0; i < len; i += BATCH_SIZE) {
+        await db.batch(statements.slice(i, Math.min(i + BATCH_SIZE, len)));
+    }
 };
 
-// --- 经过优化的排序函数 ---
-const sortByRegion = (ips) => {
-    const REGION_ORDER = new Map(REGIONS.map((r, i) => [r, i]));
-    const UNKNOWN_REGION_INDEX = REGIONS.length;
-
-    const sortableIps = ips.map(ip => ({
-        ...ip,
-        _regionIndex: ip.region ? (REGION_ORDER.get(ip.region) ?? UNKNOWN_REGION_INDEX) : UNKNOWN_REGION_INDEX,
-        _isV6: ip.ip.startsWith('[') ? 0 : 1,
-    }));
-
-    return sortableIps.sort((a, b) => 
-        a._regionIndex - b._regionIndex ||
-        a.priority - b.priority ||
-        a._isV6 - b._isV6 ||
-        a.id - b.id
-    );
-};
-
-// --- 其他工具函数 ---
-const generateVless = (dbIpRow, host) => {
-    const { displayIp, port } = parseIP(dbIpRow.ip);
-    const name = dbIpRow.name;
-    const encodedName = name ? encodeURIComponent(name) : encodeURIComponent(`${displayIp.replace(/[\.\[\]:]/g, '-')}-${port}`);
-    const effectiveHost = host || displayIp;
-    return `vless://${UUID}@${displayIp}:${port}?encryption=none&security=tls&type=ws&host=${effectiveHost}&path=%2F%3Fed%3D2560&sni=${effectiveHost}#${encodedName}`;
-};
-
+// --- 任务状态管理（优化版）---
 const saveTask = async (kv, id, status, msg = '') => {
     const data = { status, message: msg, timestamp: Date.now() };
-    tasks[id] = data;
-    setTimeout(() => delete tasks[id], 300000);
+    taskCache.set(id, data);
+    setTimeout(() => taskCache.delete(id), TASK_TTL * 1000);
     if (kv) {
-        await kv.put(`task:${id}`, JSON.stringify(data), { expirationTtl: 300 }).catch(console.error);
+        await kv.put(`task:${id}`, JSON.stringify(data), { expirationTtl: TASK_TTL }).catch(() => {});
     }
 };
 
 const getTask = async (kv, id) => {
-    if (tasks[id]) return tasks[id];
+    const cached = taskCache.get(id);
+    if (cached) return cached;
     if (kv) {
         try {
-            const data = await kv.get(`task:${id}`);
-            return data ? JSON.parse(data) : null;
-        } catch { /* 忽略读取错误 */ }
+            const data = await kv.get(`task:${id}`, { type: 'json' });
+            if (data) {
+                taskCache.set(id, data);
+                return data;
+            }
+        } catch {}
     }
     return null;
 };
 
-// --- API 实现 (最终修正优化版) ---
-const api = {
-    async getIps(db, params) {
-        const page = parseInt(params.get('page') || '1');
-        const limit = parseInt(params.get('limit') || PAGE_SIZE);
-        const offset = (page - 1) * limit;
+// --- 缓存管理 ---
+const invalidateCache = async (kv) => {
+    if (kv) {
+        await kv.delete(STATS_CACHE_KEY).catch(() => {});
+    }
+};
 
-        const baseQuery = db.prepare('SELECT id, ip, name, active, priority FROM ips ORDER BY id LIMIT ? OFFSET ?').bind(limit, offset);
-        
-        if (params.get('needTotal') !== 'true') {
-            const { results } = await baseQuery.all();
-            const ips = results.map(r => {
-                const { displayIp, port } = parseIP(r.ip);
-                return { ...r, displayIp, port, region: extractRegion(r.name) };
-            });
-            return json({ ips, pagination: { page, limit } });
+const getCachedStats = async (kv) => {
+    if (!kv) return null;
+    try {
+        return await kv.get(STATS_CACHE_KEY, { type: 'json' });
+    } catch {
+        return null;
+    }
+};
+
+const setCachedStats = async (kv, stats) => {
+    if (kv) {
+        await kv.put(STATS_CACHE_KEY, JSON.stringify(stats), { expirationTtl: CACHE_TTL }).catch(() => {});
+    }
+};
+
+// --- VLESS 生成优化 ---
+const generateVless = (row, host) => {
+    const { displayIp, port } = parseIP(row.ip);
+    const effectiveHost = host || displayIp;
+    const name = row.name || `${displayIp.replace(/[\.\[\]:]/g, '-')}-${port}`;
+    return `vless://${UUID}@${displayIp}:${port}?encryption=none&security=tls&type=ws&host=${effectiveHost}&path=%2F%3Fed%3D2560&sni=${effectiveHost}#${encodeURIComponent(name)}`;
+};
+
+// --- 排序优化 ---
+const sortByRegion = (items) => {
+    return items.sort((a, b) => {
+        const ai = getRegionIndex(a.region);
+        const bi = getRegionIndex(b.region);
+        if (ai !== bi) return ai - bi;
+        if (a.priority !== b.priority) return a.priority - b.priority;
+        const av6 = a.ip.startsWith('[') ? 0 : 1;
+        const bv6 = b.ip.startsWith('[') ? 0 : 1;
+        if (av6 !== bv6) return av6 - bv6;
+        return a.id - b.id;
+    });
+};
+
+// --- ID 重排序优化（使用负数临时ID避免冲突）---
+const performIdReorder = async (db, sortedIds) => {
+    if (sortedIds.length === 0) return;
+
+    // 使用两阶段更新：先设为负数，再设为正序
+    const tempStmts = sortedIds.map((id, i) =>
+        db.prepare('UPDATE ips SET id = ? WHERE id = ?').bind(-(i + 1), id)
+    );
+    const finalStmts = sortedIds.map((_, i) =>
+        db.prepare('UPDATE ips SET id = ? WHERE id = ?').bind(i + 1, -(i + 1))
+    );
+
+    await execBatches(db, tempStmts);
+    await execBatches(db, finalStmts);
+};
+
+// --- API 实现 ---
+const api = {
+    // 获取 IP 列表（优化分页）
+    async getIps(db, params) {
+        const page = Math.max(1, parseInt(params.get('page')) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(params.get('limit')) || PAGE_SIZE));
+        const offset = (page - 1) * limit;
+        const needTotal = params.get('needTotal') === 'true';
+
+        const queries = [
+            db.prepare('SELECT id, ip, name, active, priority FROM ips ORDER BY id LIMIT ? OFFSET ?').bind(limit, offset)
+        ];
+
+        if (needTotal) {
+            queries.push(db.prepare('SELECT COUNT(*) as total FROM ips'));
         }
 
-        const countQuery = db.prepare('SELECT COUNT(*) as total FROM ips');
-        const [data, totalResult] = await db.batch([baseQuery, countQuery]);
-        
-        const ips = data.results.map(r => {
+        const results = await db.batch(queries);
+        const ips = results[0].results.map(r => {
             const { displayIp, port } = parseIP(r.ip);
             return { ...r, displayIp, port, region: extractRegion(r.name) };
         });
-        const total = totalResult.results[0].total;
 
-        return json({
-            ips,
-            pagination: { page, limit, total, pages: Math.ceil(total / limit) },
-        });
+        const pagination = { page, limit };
+        if (needTotal) {
+            const total = results[1].results[0].total;
+            pagination.total = total;
+            pagination.pages = Math.ceil(total / limit);
+        }
+
+        return json({ ips, pagination });
     },
 
-    async getStats(db) {
+    // 获取统计信息（带缓存）
+    async getStats(db, kv) {
+        const cached = await getCachedStats(kv);
+        if (cached) return json(cached);
+
         const { total, active } = await db.prepare('SELECT COUNT(*) as total, SUM(active) as active FROM ips').first();
-        return json({ total, active: active || 0, inactive: total - (active || 0) });
+        const stats = { total, active: active || 0, inactive: total - (active || 0) };
+
+        await setCachedStats(kv, stats);
+        return json(stats);
     },
 
+    // 获取任务状态
     async getTaskStatus(kv, taskId) {
         const task = await getTask(kv, taskId);
-        if (!task) return err('任务不存在或已过期', 404);
-        return json(task);
+        return task ? json(task) : err('任务不存在或已过期', 404);
     },
 
-    async addIp(db, { ip, priority }) {
+    // 添加单个 IP
+    async addIp(db, { ip, priority }, kv) {
         if (!ip) return err('IP不能为空');
+
         const { displayIp, port, name } = parseIP(ip);
         if (port === 'N/A') return err('IP格式错误');
-        
+
+        const finalIp = `${displayIp}:${port}`;
+
+        // 使用单次查询获取最大优先级（如果未指定）
         let prio = priority;
         if (prio === undefined || prio === null) {
-            const result = await db.prepare('SELECT COALESCE(MAX(priority), 0) + 1 as n FROM ips').first();
-            prio = result.n;
+            const { n } = await db.prepare('SELECT COALESCE(MAX(priority), 0) + 1 as n FROM ips').first();
+            prio = n;
         }
-        
+
         const { meta } = await db.prepare('INSERT OR IGNORE INTO ips(ip, name, active, priority) VALUES(?, ?, 1, ?)')
-            .bind(`${displayIp}:${port}`, name || null, prio).run();
+            .bind(finalIp, name || null, prio).run();
 
         if (meta.changes === 0) return err('IP已存在');
+
+        await invalidateCache(kv);
         return json({ success: true });
     },
 
+    // 批量导入
     async batchImport(db, { ips }, ctx, kv) {
         if (!Array.isArray(ips) || !ips.length) return err('列表为空');
+
         const taskId = crypto.randomUUID();
-        const importTask = async () => {
+
+        ctx.waitUntil((async () => {
             try {
                 await saveTask(kv, taskId, 'running', '准备导入');
-                const { p } = await db.prepare('SELECT COALESCE(MAX(priority), 0) as p FROM ips').first();
-                const stmt = db.prepare('INSERT OR IGNORE INTO ips(ip, name, active, priority) VALUES(?, ?, 1, ?)');
-                const batch = ips.map((ip, i) => {
+
+                // 预处理所有 IP
+                const parsed = ips.map(ip => {
                     const { displayIp, port, name } = parseIP(ip);
-                    if (port === 'N/A') return null;
-                    return stmt.bind(`${displayIp}:${port}`, name || null, p + i + 1);
+                    return port === 'N/A' ? null : { ip: `${displayIp}:${port}`, name: name || null };
                 }).filter(Boolean);
 
-                if (batch.length) {
-                    await saveTask(kv, taskId, 'running', `正在导入 ${batch.length} 条数据...`);
-                    await execBatches(db, batch);
+                if (parsed.length === 0) {
+                    await saveTask(kv, taskId, 'completed', '没有有效的IP地址');
+                    return;
                 }
-                await saveTask(kv, taskId, 'completed', `成功导入 ${batch.length} 条数据`);
+
+                const { p } = await db.prepare('SELECT COALESCE(MAX(priority), 0) as p FROM ips').first();
+
+                await saveTask(kv, taskId, 'running', `正在导入 ${parsed.length} 条数据...`);
+
+                const stmt = db.prepare('INSERT OR IGNORE INTO ips(ip, name, active, priority) VALUES(?, ?, 1, ?)');
+                const batch = parsed.map((item, i) => stmt.bind(item.ip, item.name, p + i + 1));
+
+                await execBatches(db, batch);
+                await invalidateCache(kv);
+                await saveTask(kv, taskId, 'completed', `成功导入 ${parsed.length} 条数据`);
             } catch (e) {
                 await saveTask(kv, taskId, 'failed', e.message);
-                console.error('Import Error:', e);
             }
-        };
-        ctx.waitUntil(importTask());
+        })());
+
         return json({ success: true, async: true, taskId, count: ips.length });
     },
 
+    // 批量删除
     async batchDelete(db, { ips }, ctx, kv) {
         if (!Array.isArray(ips) || !ips.length) return err('列表为空');
+
         const taskId = crypto.randomUUID();
-        const deleteTask = async () => {
+
+        ctx.waitUntil((async () => {
             try {
                 await saveTask(kv, taskId, 'running', '准备删除');
+
                 const deleteIps = ips.map(line => {
+                    // 尝试从 VLESS 链接提取
                     const match = line.match(VLESS_EXTRACT_REGEX);
                     if (match) return match[1];
+                    // 按普通格式解析
                     const { displayIp, port } = parseIP(line);
                     return port === 'N/A' ? null : `${displayIp}:${port}`;
                 }).filter(Boolean);
 
-                if (deleteIps.length) {
-                    await execBatches(db, deleteIps.map(ip => db.prepare('DELETE FROM ips WHERE ip=?').bind(ip)));
+                if (deleteIps.length === 0) {
+                    await saveTask(kv, taskId, 'completed', '没有有效的IP地址');
+                    return;
                 }
+
+                await saveTask(kv, taskId, 'running', `正在删除 ${deleteIps.length} 条数据...`);
+
+                const batch = deleteIps.map(ip => db.prepare('DELETE FROM ips WHERE ip=?').bind(ip));
+                await execBatches(db, batch);
+
+                await invalidateCache(kv);
                 await saveTask(kv, taskId, 'completed', `成功删除 ${deleteIps.length} 条匹配的数据`);
             } catch (e) {
                 await saveTask(kv, taskId, 'failed', e.message);
-                console.error('Delete Error:', e);
             }
-        };
-        ctx.waitUntil(deleteTask());
+        })());
+
         return json({ success: true, async: true, taskId, count: ips.length });
     },
 
-    async _performSort(db, sortedIds) {
-        if (sortedIds.length === 0) return;
-        const tempUpdates = sortedIds.map((id, index) => db.prepare('UPDATE ips SET id = ? WHERE id = ?').bind(-(index + 1), id));
-        const finalUpdates = sortedIds.map((id, index) => db.prepare('UPDATE ips SET id = ? WHERE id = ?').bind(index + 1, -(index + 1)));
-        
-        await execBatches(db, tempUpdates);
-        await execBatches(db, finalUpdates);
-    },
-
+    // 按地区排序
     async sortIps(db, ctx, kv) {
         const taskId = crypto.randomUUID();
-        ctx.waitUntil(
-            (async () => {
-                try {
-                    await saveTask(kv, taskId, 'running', '查询数据');
-                    const { results } = await db.prepare('SELECT id, ip, name, priority FROM ips').all();
-                    await saveTask(kv, taskId, 'running', '排序中');
-                    const parsed = results.map(r => ({ ...r, region: extractRegion(r.name) }));
-                    const sorted = sortByRegion(parsed);
-                    await saveTask(kv, taskId, 'running', '更新数据库');
-                    await api._performSort(db, sorted.map(s => s.id));
-                    await saveTask(kv, taskId, 'completed', '排序完成');
-                } catch (e) {
-                    await saveTask(kv, taskId, 'failed', e.message);
-                    console.error('Sort Error:', e);
+
+        ctx.waitUntil((async () => {
+            try {
+                await saveTask(kv, taskId, 'running', '查询数据');
+                const { results } = await db.prepare('SELECT id, ip, name, priority FROM ips').all();
+
+                if (results.length === 0) {
+                    await saveTask(kv, taskId, 'completed', '没有数据需要排序');
+                    return;
                 }
-            })()
-        );
+
+                await saveTask(kv, taskId, 'running', '排序中');
+                const parsed = results.map(r => ({ ...r, region: extractRegion(r.name) }));
+                const sorted = sortByRegion(parsed);
+
+                await saveTask(kv, taskId, 'running', '更新数据库');
+                await performIdReorder(db, sorted.map(s => s.id));
+
+                await invalidateCache(kv);
+                await saveTask(kv, taskId, 'completed', '排序完成');
+            } catch (e) {
+                await saveTask(kv, taskId, 'failed', e.message);
+            }
+        })());
+
         return json({ success: true, async: true, taskId });
     },
-    
+
+    // 按优先级排序
     async sortByPriority(db, ctx, kv) {
         const taskId = crypto.randomUUID();
-        ctx.waitUntil(
-            (async () => {
-                try {
-                    await saveTask(kv, taskId, 'running', '查询数据');
-                    const { results } = await db.prepare('SELECT id, priority FROM ips').all();
-                    await saveTask(kv, taskId, 'running', '排序中');
-                    results.sort((a,b) => a.priority - b.priority || a.id - b.id);
-                    await saveTask(kv, taskId, 'running', '更新数据库');
-                    await api._performSort(db, results.map(r => r.id));
-                    await saveTask(kv, taskId, 'completed', '按优先级排序完成');
-                } catch (e) {
-                    await saveTask(kv, taskId, 'failed', e.message);
-                    console.error('Sort by Priority Error:', e);
+
+        ctx.waitUntil((async () => {
+            try {
+                await saveTask(kv, taskId, 'running', '查询数据');
+                const { results } = await db.prepare('SELECT id, priority FROM ips').all();
+
+                if (results.length === 0) {
+                    await saveTask(kv, taskId, 'completed', '没有数据需要排序');
+                    return;
                 }
-            })()
-        );
+
+                await saveTask(kv, taskId, 'running', '排序中');
+                results.sort((a, b) => a.priority - b.priority || a.id - b.id);
+
+                await saveTask(kv, taskId, 'running', '更新数据库');
+                await performIdReorder(db, results.map(r => r.id));
+
+                await invalidateCache(kv);
+                await saveTask(kv, taskId, 'completed', '按优先级排序完成');
+            } catch (e) {
+                await saveTask(kv, taskId, 'failed', e.message);
+            }
+        })());
+
         return json({ success: true, async: true, taskId });
     },
-    
+
+    // 去除重复
     async removeDuplicates(db, ctx, kv) {
         const taskId = crypto.randomUUID();
-        ctx.waitUntil(
-            (async () => {
-                try {
-                    await saveTask(kv, taskId, 'running', '查找重复项');
-                    const { results } = await db.prepare("SELECT GROUP_CONCAT(id, ',') as ids FROM ips GROUP BY SUBSTR(ip, 1, INSTR(ip, ':') - 1) HAVING COUNT(id) > 1").all();
-                    
-                    if (results.length === 0) {
-                        await saveTask(kv, taskId, 'completed', '没有发现重复数据');
-                        return;
-                    }
-                    
-                    const deleteIds = results.flatMap(r => 
-                        r.ids.split(',').map(Number).sort((a,b) => a-b).slice(1)
-                    );
 
-                    if (deleteIds.length > 0) {
-                        await saveTask(kv, taskId, 'running', `正在删除 ${deleteIds.length} 条重复数据...`);
-                        const batch = deleteIds.map(id => db.prepare('DELETE FROM ips WHERE id = ?').bind(id));
-                        await execBatches(db, batch);
-                        await saveTask(kv, taskId, 'completed', `成功删除 ${deleteIds.length} 条重复数据`);
-                    } else {
-                        await saveTask(kv, taskId, 'completed', '重复数据清理完成');
-                    }
-                } catch (e) {
-                    await saveTask(kv, taskId, 'failed', e.message);
-                    console.error('Remove Duplicates Error:', e);
+        ctx.waitUntil((async () => {
+            try {
+                await saveTask(kv, taskId, 'running', '查找重复项');
+
+                // 优化：直接在SQL中找出需要删除的ID
+                const { results } = await db.prepare(`
+                    SELECT GROUP_CONCAT(id) as ids
+                    FROM ips
+                    GROUP BY SUBSTR(ip, 1, INSTR(ip, ':') - 1)
+                    HAVING COUNT(*) > 1
+                `).all();
+
+                if (results.length === 0) {
+                    await saveTask(kv, taskId, 'completed', '没有发现重复数据');
+                    return;
                 }
-            })()
-        );
+
+                // 提取需要删除的ID（保留每组中ID最小的）
+                const deleteIds = results.flatMap(r =>
+                    r.ids.split(',').map(Number).sort((a, b) => a - b).slice(1)
+                );
+
+                if (deleteIds.length === 0) {
+                    await saveTask(kv, taskId, 'completed', '重复数据清理完成');
+                    return;
+                }
+
+                await saveTask(kv, taskId, 'running', `正在删除 ${deleteIds.length} 条重复数据...`);
+
+                const batch = deleteIds.map(id => db.prepare('DELETE FROM ips WHERE id = ?').bind(id));
+                await execBatches(db, batch);
+
+                await invalidateCache(kv);
+                await saveTask(kv, taskId, 'completed', `成功删除 ${deleteIds.length} 条重复数据`);
+            } catch (e) {
+                await saveTask(kv, taskId, 'failed', e.message);
+            }
+        })());
+
         return json({ success: true, async: true, taskId });
     },
-    
+
+    // 重新排列优先级
     async reorderPriority(db, ctx, kv) {
         const taskId = crypto.randomUUID();
-        ctx.waitUntil(
-            (async () => {
-                try {
-                    await saveTask(kv, taskId, 'running', '查询数据');
-                    const { results } = await db.prepare('SELECT id, name FROM ips ORDER BY id').all();
-                    
-                    const parsed = results.map(r => ({ ...r, region: extractRegion(r.name) }));
-                    const REGION_ORDER = new Map(REGIONS.map((r, i) => [r, i]));
-                    const UNKNOWN_REGION_INDEX = REGIONS.length;
-                    
-                    parsed.sort((a,b) => {
-                        const ai = a.region ? (REGION_ORDER.get(a.region) ?? UNKNOWN_REGION_INDEX) : UNKNOWN_REGION_INDEX;
-                        const bi = b.region ? (REGION_ORDER.get(b.region) ?? UNKNOWN_REGION_INDEX) : UNKNOWN_REGION_INDEX;
-                        return ai - bi || a.id - b.id;
-                    });
 
-                    await saveTask(kv, taskId, 'running', '更新优先级');
-                    const batch = parsed.map((r, i) => db.prepare('UPDATE ips SET priority = ? WHERE id = ?').bind(i + 1, r.id));
-                    await execBatches(db, batch);
-                    await saveTask(kv, taskId, 'completed', '优先级调整完成');
-                } catch (e) {
-                    await saveTask(kv, taskId, 'failed', e.message);
-                    console.error('Reorder Priority Error:', e);
+        ctx.waitUntil((async () => {
+            try {
+                await saveTask(kv, taskId, 'running', '查询数据');
+                const { results } = await db.prepare('SELECT id, name FROM ips ORDER BY id').all();
+
+                if (results.length === 0) {
+                    await saveTask(kv, taskId, 'completed', '没有数据需要调整');
+                    return;
                 }
-            })()
-        );
+
+                await saveTask(kv, taskId, 'running', '计算优先级');
+                const parsed = results.map(r => ({ ...r, region: extractRegion(r.name) }));
+
+                // 按地区排序
+                parsed.sort((a, b) => {
+                    const ai = getRegionIndex(a.region);
+                    const bi = getRegionIndex(b.region);
+                    return ai - bi || a.id - b.id;
+                });
+
+                await saveTask(kv, taskId, 'running', '更新优先级');
+                const batch = parsed.map((r, i) =>
+                    db.prepare('UPDATE ips SET priority = ? WHERE id = ?').bind(i + 1, r.id)
+                );
+                await execBatches(db, batch);
+
+                await invalidateCache(kv);
+                await saveTask(kv, taskId, 'completed', '优先级调整完成');
+            } catch (e) {
+                await saveTask(kv, taskId, 'failed', e.message);
+            }
+        })());
+
         return json({ success: true, async: true, taskId });
     },
 
+    // 切换所有状态
     async toggleAll(db, { active }, ctx, kv) {
         const taskId = crypto.randomUUID();
-        ctx.waitUntil(
-            (async () => {
-                try {
-                    await saveTask(kv, taskId, 'running', '更新中');
-                    await db.prepare('UPDATE ips SET active = ?').bind(active ? 1 : 0).run();
-                    await saveTask(kv, taskId, 'completed', '更新完成');
-                } catch (e) {
-                    await saveTask(kv, taskId, 'failed', e.message);
-                    console.error('Toggle All Error:', e);
-                }
-            })()
-        );
+
+        ctx.waitUntil((async () => {
+            try {
+                await saveTask(kv, taskId, 'running', '更新中');
+                await db.prepare('UPDATE ips SET active = ?').bind(active ? 1 : 0).run();
+                await invalidateCache(kv);
+                await saveTask(kv, taskId, 'completed', '更新完成');
+            } catch (e) {
+                await saveTask(kv, taskId, 'failed', e.message);
+            }
+        })());
+
         return json({ success: true, async: true, taskId });
     },
 
+    // 清空所有
     async clearAll(db, ctx, kv) {
         const taskId = crypto.randomUUID();
-        ctx.waitUntil(
-            (async () => {
-                try {
-                    await saveTask(kv, taskId, 'running', '清空中');
-                    await db.prepare('DELETE FROM ips').run();
-                    await saveTask(kv, taskId, 'completed', '清空完成');
-                } catch (e) {
-                    await saveTask(kv, taskId, 'failed', e.message);
-                    console.error('Clear All Error:', e);
-                }
-            })()
-        );
+
+        ctx.waitUntil((async () => {
+            try {
+                await saveTask(kv, taskId, 'running', '清空中');
+                await db.prepare('DELETE FROM ips').run();
+                await invalidateCache(kv);
+                await saveTask(kv, taskId, 'completed', '清空完成');
+            } catch (e) {
+                await saveTask(kv, taskId, 'failed', e.message);
+            }
+        })());
+
         return json({ success: true, async: true, taskId });
     },
 
-    async updateIp(db, id, body) {
+    // 更新单个 IP
+    async updateIp(db, id, body, kv) {
         const { active, ip, priority } = body;
-        
+        const updates = [];
+
         if (ip !== undefined) {
             const { displayIp, port, name } = parseIP(ip);
             if (port === 'N/A') return err('IP格式错误');
-            await db.prepare('UPDATE ips SET ip=?, name=? WHERE id=?').bind(`${displayIp}:${port}`, name || null, id).run();
+            updates.push(db.prepare('UPDATE ips SET ip=?, name=? WHERE id=?').bind(`${displayIp}:${port}`, name || null, id));
         }
+
         if (active !== undefined) {
-            await db.prepare('UPDATE ips SET active=? WHERE id=?').bind(active ? 1 : 0, id).run();
+            updates.push(db.prepare('UPDATE ips SET active=? WHERE id=?').bind(active ? 1 : 0, id));
         }
+
         if (priority !== undefined) {
-            const { current_priority } = await db.prepare('SELECT priority as current_priority FROM ips WHERE id=?').bind(id).first();
-            await db.batch([
-                db.prepare('UPDATE ips SET priority = ? WHERE priority = ? AND id != ?').bind(current_priority, priority, id),
-                db.prepare('UPDATE ips SET priority = ? WHERE id = ?').bind(priority, id)
-            ]);
+            const row = await db.prepare('SELECT priority FROM ips WHERE id=?').bind(id).first();
+            if (row) {
+                updates.push(
+                    db.prepare('UPDATE ips SET priority = ? WHERE priority = ? AND id != ?').bind(row.priority, priority, id),
+                    db.prepare('UPDATE ips SET priority = ? WHERE id = ?').bind(priority, id)
+                );
+            }
         }
-        
+
+        if (updates.length > 0) {
+            await db.batch(updates);
+            await invalidateCache(kv);
+        }
+
         return json({ success: true });
     },
 
-    async deleteIp(db, id) {
+    // 删除单个 IP
+    async deleteIp(db, id, kv) {
         await db.prepare('DELETE FROM ips WHERE id=?').bind(id).run();
+        await invalidateCache(kv);
         return json({ success: true });
     },
 
+    // 初始化数据库
     async initDb(db) {
         await db.batch([
             db.prepare('CREATE TABLE IF NOT EXISTS ips(id INTEGER PRIMARY KEY, ip TEXT UNIQUE NOT NULL, name TEXT, active INTEGER DEFAULT 1, priority INTEGER DEFAULT 0)'),
@@ -397,1205 +545,224 @@ const api = {
     },
 };
 
-// --- 路由分发器 (最终修正版) ---
-const route = (req, db, ctx, kv) => {
+// --- 路由分发 ---
+const route = async (req, db, ctx, kv) => {
     const url = new URL(req.url);
-    const apiPath = url.pathname.slice(4);
+    const path = url.pathname.slice(4); // 去掉 '/api'
     const method = req.method;
 
-    const handle = async () => {
+    try {
+        // POST/PUT 请求解析 body
         const body = (method === 'POST' || method === 'PUT') ? await req.json().catch(() => ({})) : {};
-        
-        const routes = {
-            '/ips': { GET: () => api.getIps(db, url.searchParams), POST: () => api.addIp(db, body) },
-            '/ips/stats': { GET: () => api.getStats(db) },
-            '/ips/batch': { POST: () => api.batchImport(db, body, ctx, kv) },
-            '/ips/batch-delete': { POST: () => api.batchDelete(db, body, ctx, kv) },
-            '/ips/sort': { POST: () => api.sortIps(db, ctx, kv) },
-            '/ips/sort-priority': { POST: () => api.sortByPriority(db, ctx, kv) },
-            '/ips/remove-duplicates': { POST: () => api.removeDuplicates(db, ctx, kv) },
-            '/ips/reorder-priority': { POST: () => api.reorderPriority(db, ctx, kv) },
-            '/ips/toggle-all': { POST: () => api.toggleAll(db, body, ctx, kv) },
-            '/ips/clear': { DELETE: () => api.clearAll(db, ctx, kv) },
-            '/init': { POST: () => api.initDb(db) },
-        };
 
-        if (routes[apiPath] && routes[apiPath][method]) {
-            return routes[apiPath][method]();
+        // 静态路由表
+        if (path === '/ips') {
+            if (method === 'GET') return api.getIps(db, url.searchParams);
+            if (method === 'POST') return api.addIp(db, body, kv);
+        }
+        if (path === '/ips/stats' && method === 'GET') return api.getStats(db, kv);
+        if (path === '/ips/batch' && method === 'POST') return api.batchImport(db, body, ctx, kv);
+        if (path === '/ips/batch-delete' && method === 'POST') return api.batchDelete(db, body, ctx, kv);
+        if (path === '/ips/sort' && method === 'POST') return api.sortIps(db, ctx, kv);
+        if (path === '/ips/sort-priority' && method === 'POST') return api.sortByPriority(db, ctx, kv);
+        if (path === '/ips/remove-duplicates' && method === 'POST') return api.removeDuplicates(db, ctx, kv);
+        if (path === '/ips/reorder-priority' && method === 'POST') return api.reorderPriority(db, ctx, kv);
+        if (path === '/ips/toggle-all' && method === 'POST') return api.toggleAll(db, body, ctx, kv);
+        if (path === '/ips/clear' && method === 'DELETE') return api.clearAll(db, ctx, kv);
+        if (path === '/init' && method === 'POST') return api.initDb(db);
+
+        // 动态路由：任务状态
+        if (path.startsWith('/task/') && method === 'GET') {
+            return api.getTaskStatus(kv, path.slice(6));
         }
 
-        const taskMatch = apiPath.match(/^\/task\/([a-f0-9-]+)$/);
-        if (taskMatch && method === 'GET') return api.getTaskStatus(kv, taskMatch[1]);
-        
-        const idMatch = apiPath.match(/^\/ips\/(\d+)$/);
+        // 动态路由：单个 IP 操作
+        const idMatch = path.match(/^\/ips\/(\d+)$/);
         if (idMatch) {
-            if (method === 'PUT') return api.updateIp(db, idMatch[1], body);
-            if (method === 'DELETE') return api.deleteIp(db, idMatch[1]);
+            const id = idMatch[1];
+            if (method === 'PUT') return api.updateIp(db, id, body, kv);
+            if (method === 'DELETE') return api.deleteIp(db, id, kv);
         }
-        
-        return new Response('Not Found', { status: 404 });
-    };
 
-    return handle().catch(e => {
-        console.error(e);
+        return new Response('Not Found', { status: 404 });
+    } catch (e) {
+        console.error('API Error:', e);
         return err(e.message, 500);
-    });
+    }
 };
 
+// --- HTML 模板（压缩CSS变量，优化结构）---
 const getHTML = () => `<!DOCTYPE html>
-<html>
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>节点管理</title>
 <style>
-	:root {
-		--bg: #0d1117;
-		--bg-secondary: #161b22;
-		--bg-tertiary: #21262d;
-		--fg: #e6edf3;
-		--fg-secondary: #b3bac4;
-		--fg-tertiary: #8b949e;
-		--card: #161b22;
-		--card-hover: #1c2128;
-		--border: #30363d;
-		--border-light: #21262d;
-		--input: #0d1117;
-		--input-focus: #151b23;
-		--blue: #58a6ff;
-		--blue-light: #79c0ff;
-		--green: #3fb950;
-		--green-light: #56d364;
-		--red: #f85149;
-		--red-light: #ff7b72;
-		--yellow: #d29922;
-		--yellow-light: #e3b341;
-		--purple: #a371f7;
-		--purple-light: #bc8cff;
-		--orange: #db6d28;
-		--orange-light: #ffa657;
-		--cyan: #39c5cf;
-		--gray: #6e7681;
-		--shadow: 0 4px 24px rgba(1, 4, 9, 0.8);
-		--shadow-light: 0 2px 16px rgba(1, 4, 9, 0.6);
-		--gradient: linear-gradient(135deg, var(--blue), var(--purple));
-		--gradient-green: linear-gradient(135deg, var(--green), var(--cyan));
-		--gradient-orange: linear-gradient(135deg, var(--orange), var(--yellow));
-		--radius: 12px;
-		--radius-lg: 16px;
-		--transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-	}
-
-	* {
-		margin: 0;
-		padding: 0;
-		box-sizing: border-box;
-	}
-
-	body {
-		font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;
-		background: var(--bg);
-		color: var(--fg);
-		line-height: 1.6;
-		min-height: 100vh;
-		font-size: 15px;
-		font-weight: 400;
-		-webkit-font-smoothing: antialiased;
-		-moz-osx-font-smoothing: grayscale;
-	}
-
-	.container {
-		max-width: 1400px;
-		margin: 0 auto;
-		padding: 30px 24px;
-	}
-
-	.header {
-		text-align: center;
-		margin-bottom: 48px;
-		padding: 0 20px;
-	}
-
-	h1 {
-		font-size: 40px;
-		font-weight: 700;
-		margin-bottom: 12px;
-		background: linear-gradient(135deg, var(--blue), var(--purple));
-		-webkit-background-clip: text;
-		background-clip: text;
-		color: transparent;
-		letter-spacing: -0.5px;
-	}
-
-	.subtitle {
-		font-size: 17px;
-		color: var(--fg-secondary);
-		font-weight: 400;
-		line-height: 1.5;
-	}
-
-	.section {
-		background: var(--card);
-		border-radius: var(--radius-lg);
-		padding: 32px;
-		margin-bottom: 28px;
-		border: 1px solid var(--border);
-		box-shadow: var(--shadow-light);
-		transition: var(--transition);
-	}
-
-	.section:hover {
-		box-shadow: var(--shadow);
-		border-color: var(--border-light);
-	}
-
-	.section h2 {
-		font-size: 22px;
-		font-weight: 600;
-		color: var(--fg);
-		margin-bottom: 24px;
-		display: flex;
-		align-items: center;
-		gap: 12px;
-	}
-
-	.section h2::before {
-		content: '';
-		width: 4px;
-		height: 20px;
-		background: var(--blue);
-		border-radius: 2px;
-	}
-
-	.form-group {
-		margin-bottom: 24px;
-	}
-
-	label {
-		display: block;
-		margin-bottom: 10px;
-		color: var(--fg-secondary);
-		font-size: 14px;
-		font-weight: 500;
-	}
-
-	input, textarea, select {
-		width: 100%;
-		padding: 14px 16px;
-		background: var(--input);
-		border: 1px solid var(--border);
-		border-radius: var(--radius);
-		color: var(--fg);
-		font: inherit;
-		font-size: 15px;
-		transition: var(--transition);
-	}
-
-	input:focus, textarea:focus, select:focus {
-		outline: none;
-		border-color: var(--blue);
-		background: var(--input-focus);
-		box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.1);
-	}
-
-	input::placeholder, textarea::placeholder {
-		color: var(--fg-tertiary);
-	}
-
-	button {
-		background: var(--blue);
-		color: white;
-		border: none;
-		padding: 14px 28px;
-		border-radius: var(--radius);
-		cursor: pointer;
-		font-size: 15px;
-		font-weight: 500;
-		transition: var(--transition);
-		display: inline-flex;
-		align-items: center;
-		gap: 8px;
-		position: relative;
-		overflow: hidden;
-	}
-
-	button::before {
-		content: '';
-		position: absolute;
-		top: 0;
-		left: -100%;
-		width: 100%;
-		height: 100%;
-		background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.1), transparent);
-		transition: left 0.6s;
-	}
-
-	button:hover::before {
-		left: 100%;
-	}
-
-	button:hover {
-		background: var(--blue-light);
-		transform: translateY(-1px);
-		box-shadow: 0 6px 20px rgba(88, 166, 255, 0.2);
-	}
-
-	button:active {
-		transform: translateY(0);
-	}
-
-	button.danger {
-		background: var(--red);
-	}
-
-	button.danger:hover {
-		background: var(--red-light);
-		box-shadow: 0 6px 20px rgba(248, 81, 73, 0.2);
-	}
-
-	button.secondary {
-		background: var(--bg-tertiary);
-		color: var(--fg-secondary);
-	}
-
-	button.secondary:hover {
-		background: var(--border);
-		color: var(--fg);
-		box-shadow: 0 6px 20px rgba(110, 118, 129, 0.1);
-	}
-
-	button.success {
-		background: var(--green);
-	}
-
-	button.success:hover {
-		background: var(--green-light);
-		box-shadow: 0 6px 20px rgba(63, 185, 80, 0.2);
-	}
-
-	button.purple {
-		background: var(--purple);
-	}
-
-	button.purple:hover {
-		background: var(--purple-light);
-		box-shadow: 0 6px 20px rgba(163, 113, 247, 0.2);
-	}
-
-	button.orange {
-		background: var(--orange);
-	}
-
-	button.orange:hover {
-		background: var(--orange-light);
-		box-shadow: 0 6px 20px rgba(219, 109, 40, 0.2);
-	}
-
-	button.small {
-		padding: 10px 16px;
-		font-size: 14px;
-		border-radius: 8px;
-	}
-
-	.button-group {
-		display: flex;
-		gap: 12px;
-		flex-wrap: wrap;
-	}
-
-	.batch-actions {
-		display: flex;
-		gap: 16px;
-		justify-content: flex-start;
-		margin-top: 20px;
-	}
-
-	.stats {
-		display: grid;
-		grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-		gap: 16px;
-		margin-bottom: 28px;
-	}
-
-	.stat {
-		background: var(--bg-tertiary);
-		padding: 24px;
-		border-radius: var(--radius);
-		text-align: center;
-		border: 1px solid var(--border);
-		transition: var(--transition);
-	}
-
-	.stat:hover {
-		background: var(--card-hover);
-		transform: translateY(-2px);
-	}
-
-	.stat-number {
-		font-size: 32px;
-		font-weight: 700;
-		color: var(--blue);
-		margin-bottom: 6px;
-	}
-
-	.stat-label {
-		font-size: 14px;
-		color: var(--fg-secondary);
-		font-weight: 500;
-	}
-
-	.ip-list {
-		list-style: none;
-		display: grid;
-		gap: 12px;
-	}
-
-	.ip-item {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		padding: 20px;
-		background: var(--bg-tertiary);
-		border-radius: var(--radius);
-		border: 1px solid var(--border);
-		transition: var(--transition);
-	}
-
-	.ip-item:hover {
-		background: var(--card-hover);
-		border-color: var(--border-light);
-		transform: translateX(4px);
-	}
-
-	.ip-info {
-		flex: 1;
-		display: flex;
-		align-items: center;
-		gap: 20px;
-	}
-
-	.ip-details {
-		display: flex;
-		flex-direction: column;
-		gap: 8px;
-	}
-
-	.ip-address {
-		font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
-		font-weight: 600;
-		font-size: 15px;
-		color: var(--fg);
-		letter-spacing: -0.2px;
-	}
-
-	.ip-meta {
-		display: flex;
-		gap: 10px;
-		align-items: center;
-		flex-wrap: wrap;
-	}
-
-	.node-name {
-		font-size: 13px;
-		color: var(--blue);
-		background: rgba(88, 166, 255, 0.1);
-		padding: 4px 10px;
-		border-radius: 6px;
-		font-weight: 500;
-		border: 1px solid rgba(88, 166, 255, 0.2);
-	}
-
-	.region-tag {
-		font-size: 12px;
-		color: var(--purple);
-		background: rgba(163, 113, 247, 0.1);
-		padding: 4px 8px;
-		border-radius: 6px;
-		font-weight: 500;
-		border: 1px solid rgba(163, 113, 247, 0.2);
-	}
-
-	.priority-tag {
-		font-size: 12px;
-		color: var(--orange);
-		background: rgba(219, 109, 40, 0.1);
-		padding: 4px 8px;
-		border-radius: 6px;
-		font-weight: 500;
-		border: 1px solid rgba(219, 109, 40, 0.2);
-	}
-
-	.status {
-		padding: 6px 12px;
-		border-radius: 20px;
-		font-size: 12px;
-		font-weight: 600;
-		text-transform: uppercase;
-		letter-spacing: 0.3px;
-	}
-
-	.status.active {
-		background: rgba(63, 185, 80, 0.1);
-		color: var(--green);
-		border: 1px solid rgba(63, 185, 80, 0.2);
-	}
-
-	.status.inactive {
-		background: rgba(248, 81, 73, 0.1);
-		color: var(--red);
-		border: 1px solid rgba(248, 81, 73, 0.2);
-	}
-
-	.ip-actions {
-		display: flex;
-		gap: 10px;
-	}
-
-	.message {
-		padding: 16px 20px;
-		border-radius: var(--radius);
-		margin-bottom: 20px;
-		text-align: center;
-		font-weight: 500;
-		font-size: 14px;
-		opacity: 0;
-		animation: slideIn 0.3s ease forwards;
-		border: 1px solid;
-	}
-
-	@keyframes slideIn {
-		from { opacity: 0; transform: translateY(-10px); }
-		to { opacity: 1; transform: translateY(0); }
-	}
-
-	.message.success {
-		background: rgba(63, 185, 80, 0.1);
-		color: var(--green);
-		border-color: rgba(63, 185, 80, 0.2);
-	}
-
-	.message.error {
-		background: rgba(248, 81, 73, 0.1);
-		color: var(--red);
-		border-color: rgba(248, 81, 73, 0.2);
-	}
-
-	.form-row {
-		display: grid;
-		grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-		gap: 16px;
-	}
-
-	.actions {
-		display: flex;
-		gap: 12px;
-		margin-bottom: 24px;
-		flex-wrap: wrap;
-	}
-
-	textarea {
-		min-height: 140px;
-		font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
-		font-size: 14px;
-		line-height: 1.5;
-		resize: vertical;
-	}
-
-	.loading, .empty {
-		text-align: center;
-		padding: 60px 20px;
-		color: var(--fg-secondary);
-		font-size: 16px;
-	}
-
-	.loading {
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		gap: 16px;
-	}
-
-	.modal {
-		position: fixed;
-		inset: 0;
-		background: rgba(13, 17, 23, 0.8);
-		backdrop-filter: blur(4px);
-		display: none;
-		align-items: center;
-		justify-content: center;
-		z-index: 1000;
-		animation: fadeIn 0.2s ease;
-		padding: 20px;
-	}
-
-	.modal-content {
-		background: var(--card);
-		border-radius: var(--radius-lg);
-		padding: 32px;
-		max-width: 520px;
-		width: 100%;
-		border: 1px solid var(--border);
-		box-shadow: var(--shadow);
-		transform: scale(0.95);
-		animation: scaleUp 0.2s ease forwards;
-	}
-
-	@keyframes scaleUp {
-		to { transform: scale(1); }
-	}
-
-	.modal-header {
-		display: flex;
-		justify-content: space-between;
-		align-items: center;
-		margin-bottom: 24px;
-	}
-
-	.modal-title {
-		color: var(--fg);
-		font-size: 20px;
-		font-weight: 600;
-	}
-
-	.close-btn {
-		background: none;
-		border: none;
-		color: var(--fg-secondary);
-		font-size: 24px;
-		cursor: pointer;
-		padding: 6px;
-		border-radius: 6px;
-		transition: var(--transition);
-		width: 32px;
-		height: 32px;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-	}
-
-	.close-btn:hover {
-		color: var(--fg);
-		background: var(--bg-tertiary);
-	}
-
-	.modal-buttons {
-		display: grid;
-		grid-template-columns: 1fr 1fr;
-		gap: 12px;
-		margin-top: 20px;
-	}
-
-	.spinner {
-		border: 2px solid rgba(88, 166, 255, 0.2);
-		border-left-color: var(--blue);
-		border-radius: 50%;
-		width: 40px;
-		height: 40px;
-		animation: spin 1s linear infinite;
-	}
-
-	@keyframes spin {
-		0% { transform: rotate(0deg); }
-		100% { transform: rotate(360deg); }
-	}
-
-	.pagination {
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		gap: 16px;
-		margin-top: 24px;
-		padding: 16px;
-	}
-
-	.page-info {
-		font-size: 14px;
-		color: var(--fg-secondary);
-		font-weight: 500;
-		min-width: 100px;
-		text-align: center;
-	}
-
-	.tooltip {
-		position: relative;
-	}
-
-	.tooltip::after {
-		content: attr(data-tooltip);
-		position: absolute;
-		bottom: 100%;
-		left: 50%;
-		transform: translateX(-50%);
-		background: var(--bg-tertiary);
-		color: var(--fg);
-		padding: 6px 10px;
-		border-radius: 6px;
-		font-size: 12px;
-		white-space: nowrap;
-		opacity: 0;
-		pointer-events: none;
-		transition: opacity 0.2s ease;
-		border: 1px solid var(--border);
-		box-shadow: var(--shadow-light);
-		margin-bottom: 8px;
-	}
-
-	.tooltip:hover::after {
-		opacity: 1;
-	}
-
-	@media (max-width: 768px) {
-		.container { padding: 20px 16px; }
-		h1 { font-size: 32px; }
-		.subtitle { font-size: 15px; }
-		.section { padding: 24px; margin-bottom: 20px; }
-		.section h2 { font-size: 20px; }
-		.stats { grid-template-columns: 1fr; gap: 12px; }
-		.stat { padding: 20px; }
-		.stat-number { font-size: 28px; }
-		.ip-item { flex-direction: column; gap: 16px; align-items: flex-start; }
-		.ip-info { width: 100%; }
-		.ip-actions { width: 100%; justify-content: flex-end; }
-		.form-row { grid-template-columns: 1fr; gap: 12px; }
-		.modal-content { padding: 24px; margin: 10px; }
-		.modal-title { font-size: 18px; }
-		.button-group { flex-direction: column; }
-		.batch-actions { flex-direction: column; gap: 12px; }
-		button { width: 100%; justify-content: center; }
-		.actions { gap: 8px; }
-		.ip-meta { gap: 6px; }
-	}
-
-	@media (max-width: 480px) {
-		body { font-size: 14px; }
-		.container { padding: 16px 12px; }
-		.section { padding: 20px; border-radius: var(--radius); }
-		.section h2 { font-size: 18px; margin-bottom: 20px; }
-		input, textarea, select { padding: 12px 14px; }
-		button { padding: 12px 16px; }
-		.stat { padding: 16px; }
-		.stat-number { font-size: 24px; }
-		.modal-content { padding: 20px; }
-		.pagination { flex-direction: column; gap: 12px; }
-	}
-
-	/* 滚动条样式 */
-	::-webkit-scrollbar {
-		width: 6px;
-	}
-
-	::-webkit-scrollbar-track {
-		background: var(--bg-secondary);
-	}
-
-	::-webkit-scrollbar-thumb {
-		background: var(--border);
-		border-radius: 3px;
-	}
-
-	::-webkit-scrollbar-thumb:hover {
-		background: var(--border-light);
-	}
-
-	/* 选择文本样式 */
-	::selection {
-		background: rgba(88, 166, 255, 0.2);
-		color: inherit;
-	}
+:root{--bg:#0d1117;--bg2:#161b22;--bg3:#21262d;--fg:#e6edf3;--fg2:#b3bac4;--fg3:#8b949e;--border:#30363d;--blue:#58a6ff;--green:#3fb950;--red:#f85149;--purple:#a371f7;--orange:#db6d28;--radius:12px;--shadow:0 4px 24px rgba(1,4,9,.8)}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font:15px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;background:var(--bg);color:var(--fg);min-height:100vh}
+.container{max-width:1400px;margin:0 auto;padding:30px 24px}
+.header{text-align:center;margin-bottom:48px}
+h1{font-size:40px;font-weight:700;margin-bottom:12px;background:linear-gradient(135deg,var(--blue),var(--purple));-webkit-background-clip:text;background-clip:text;color:transparent}
+.subtitle{font-size:17px;color:var(--fg2)}
+.section{background:var(--bg2);border-radius:var(--radius);padding:32px;margin-bottom:28px;border:1px solid var(--border)}
+.section h2{font-size:22px;font-weight:600;margin-bottom:24px;display:flex;align-items:center;gap:12px}
+.section h2::before{content:'';width:4px;height:20px;background:var(--blue);border-radius:2px}
+.form-group{margin-bottom:24px}
+label{display:block;margin-bottom:10px;color:var(--fg2);font-size:14px;font-weight:500}
+input,textarea,select{width:100%;padding:14px 16px;background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);color:var(--fg);font:inherit}
+input:focus,textarea:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 3px rgba(88,166,255,.1)}
+button{background:var(--blue);color:#fff;border:none;padding:14px 28px;border-radius:var(--radius);cursor:pointer;font-size:15px;font-weight:500;transition:all .2s;display:inline-flex;align-items:center;gap:8px}
+button:hover{filter:brightness(1.1);transform:translateY(-1px)}
+button.danger{background:var(--red)}
+button.secondary{background:var(--bg3);color:var(--fg2)}
+button.success{background:var(--green)}
+button.purple{background:var(--purple)}
+button.orange{background:var(--orange)}
+button.small{padding:10px 16px;font-size:14px;border-radius:8px}
+.button-group,.batch-actions{display:flex;gap:12px;flex-wrap:wrap}
+.batch-actions{margin-top:20px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin-bottom:28px}
+.stat{background:var(--bg3);padding:24px;border-radius:var(--radius);text-align:center;border:1px solid var(--border)}
+.stat-number{font-size:32px;font-weight:700;color:var(--blue);margin-bottom:6px}
+.stat-label{font-size:14px;color:var(--fg2)}
+.ip-list{list-style:none;display:grid;gap:12px}
+.ip-item{display:flex;align-items:center;justify-content:space-between;padding:20px;background:var(--bg3);border-radius:var(--radius);border:1px solid var(--border);transition:all .2s}
+.ip-item:hover{background:#1c2128;transform:translateX(4px)}
+.ip-info{flex:1;display:flex;align-items:center;gap:20px}
+.ip-details{display:flex;flex-direction:column;gap:8px}
+.ip-address{font-family:'SF Mono',monospace;font-weight:600;font-size:15px}
+.ip-meta{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.node-name{font-size:13px;color:var(--blue);background:rgba(88,166,255,.1);padding:4px 10px;border-radius:6px;border:1px solid rgba(88,166,255,.2)}
+.region-tag{font-size:12px;color:var(--purple);background:rgba(163,113,247,.1);padding:4px 8px;border-radius:6px;border:1px solid rgba(163,113,247,.2)}
+.priority-tag{font-size:12px;color:var(--orange);background:rgba(219,109,40,.1);padding:4px 8px;border-radius:6px;border:1px solid rgba(219,109,40,.2)}
+.status{padding:6px 12px;border-radius:20px;font-size:12px;font-weight:600;text-transform:uppercase}
+.status.active{background:rgba(63,185,80,.1);color:var(--green);border:1px solid rgba(63,185,80,.2)}
+.status.inactive{background:rgba(248,81,73,.1);color:var(--red);border:1px solid rgba(248,81,73,.2)}
+.ip-actions{display:flex;gap:10px}
+.message{padding:16px 20px;border-radius:var(--radius);margin-bottom:20px;text-align:center;font-weight:500;animation:slideIn .3s ease;border:1px solid}
+@keyframes slideIn{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:translateY(0)}}
+.message.success{background:rgba(63,185,80,.1);color:var(--green);border-color:rgba(63,185,80,.2)}
+.message.error{background:rgba(248,81,73,.1);color:var(--red);border-color:rgba(248,81,73,.2)}
+.form-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px}
+.actions{display:flex;gap:12px;margin-bottom:24px;flex-wrap:wrap}
+textarea{min-height:140px;font-family:'SF Mono',monospace;font-size:14px;resize:vertical}
+.loading,.empty{text-align:center;padding:60px 20px;color:var(--fg2)}
+.loading{display:flex;flex-direction:column;align-items:center;gap:16px}
+.modal{position:fixed;inset:0;background:rgba(13,17,23,.8);backdrop-filter:blur(4px);display:none;align-items:center;justify-content:center;z-index:1000;padding:20px}
+.modal-content{background:var(--bg2);border-radius:var(--radius);padding:32px;max-width:520px;width:100%;border:1px solid var(--border);box-shadow:var(--shadow)}
+.modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}
+.modal-title{font-size:20px;font-weight:600}
+.close-btn{background:none;border:none;color:var(--fg2);font-size:24px;cursor:pointer;padding:6px;border-radius:6px;width:32px;height:32px;display:flex;align-items:center;justify-content:center}
+.close-btn:hover{color:var(--fg);background:var(--bg3)}
+.modal-buttons{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:20px}
+.spinner{border:2px solid rgba(88,166,255,.2);border-left-color:var(--blue);border-radius:50%;width:40px;height:40px;animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.pagination{display:flex;align-items:center;justify-content:center;gap:16px;margin-top:24px;padding:16px}
+.page-info{font-size:14px;color:var(--fg2);min-width:100px;text-align:center}
+@media(max-width:768px){.container{padding:20px 16px}h1{font-size:32px}.section{padding:24px}.stats{grid-template-columns:1fr}.ip-item{flex-direction:column;gap:16px;align-items:flex-start}.ip-info,.ip-actions{width:100%}.ip-actions{justify-content:flex-end}.form-row{grid-template-columns:1fr}.button-group,.batch-actions{flex-direction:column}button{width:100%;justify-content:center}}
+::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:var(--bg2)}::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
 </style>
 </head>
 <body>
 <div class="container">
-	<div class="header">
-		<h1>节点管理中心</h1>
-		<div class="subtitle">简洁高效的代理节点管理平台</div>
-	</div>
-
-	<div class="section">
-		<h2>统计概览</h2>
-		<div class="stats">
-			<div class="stat">
-				<div class="stat-number" id="total">-</div>
-				<div class="stat-label">总节点数</div>
-			</div>
-			<div class="stat">
-				<div class="stat-number" id="active">-</div>
-				<div class="stat-label">活跃节点</div>
-			</div>
-			<div class="stat">
-				<div class="stat-number" id="inactive">-</div>
-				<div class="stat-label">禁用节点</div>
-			</div>
-		</div>
-	</div>
-
-	<div class="section">
-		<h2>添加节点</h2>
-		<div class="form-group">
-			<label>IP地址</label>
-			<input id="newIp" placeholder="IPv4: 192.168.1.1 | IPv6: [2001:db8::1] | 域名: example.com">
-		</div>
-		<div class="form-row">
-			<div class="form-group">
-				<label>端口号</label>
-				<input id="newPort" placeholder="443" value="443">
-			</div>
-			<div class="form-group">
-				<label>节点名称</label>
-				<input id="newName" placeholder="香港节点01-HK">
-			</div>
-			<div class="form-group">
-				<label>优先级</label>
-				<input id="newPriority" type="number" placeholder="自动分配" min="0">
-			</div>
-		</div>
-		<button onclick="addIp()">添加节点</button>
-	</div>
-
-	<div class="section">
-		<h2>批量操作</h2>
-		<div class="form-group">
-			<label>节点列表（每行一个，支持 IP:端口#名称 格式）</label>
-			<textarea id="batchIps" placeholder="192.168.1.1:443#香港-HK&#10;[2001:db8::1]:443#日本-JP&#10;example.com:443#美国-US&#10;导入：格式仅支持IP:PORT#NAME&#10;删除：格式支持直接使用节点链接，会自动提取IP和PROT匹配删除"></textarea>
-		</div>
-		<div class="batch-actions">
-			<button onclick="batchImport()">批量导入</button>
-			<button class="danger" onclick="batchDelete()">批量删除</button>
-		</div>
-	</div>
-
-	<div class="section">
-		<h2>配置生成</h2>
-		<button class="purple" onclick="window.location.href='/Vless'">生成 Vless 链接</button>
-	</div>
-
-	<div class="section">
-		<h2>节点列表</h2>
-		<div id="message"></div>
-		
-		<div class="actions">
-			<button onclick="loadIps()">刷新</button>
-			<button class="purple" onclick="sortByRegion()">按地区排序</button>
-			<button class="purple" onclick="reorderPriority()">调整优先级</button>
-			<button class="purple" onclick="sortByPriority()">按优先级排序</button>
-			<button class="orange" onclick="removeDuplicates()">一键去重</button>
-			<button class="success" onclick="toggleAll(1)">全部启用</button>
-			<button class="secondary" onclick="toggleAll(0)">全部禁用</button>
-			<button class="danger" onclick="clearAll()">清空所有</button>
-		</div>
-
-		<div id="ipContainer">
-			<div class="loading">
-				<div class="spinner"></div>
-				<div>正在加载节点数据...</div>
-			</div>
-		</div>
-
-		<div id="pagination" class="pagination">
-			<button id="prevPageBtn" class="secondary" onclick="prevPage()">上一页</button>
-			<span id="pageInfo" class="page-info">第 1 页 / 共 1 页</span>
-			<button id="nextPageBtn" class="secondary" onclick="nextPage()">下一页</button>
-		</div>
-	</div>
+<div class="header"><h1>节点管理中心</h1><div class="subtitle">简洁高效的代理节点管理平台</div></div>
+<div class="section"><h2>统计概览</h2><div class="stats"><div class="stat"><div class="stat-number" id="total">-</div><div class="stat-label">总节点数</div></div><div class="stat"><div class="stat-number" id="active">-</div><div class="stat-label">活跃节点</div></div><div class="stat"><div class="stat-number" id="inactive">-</div><div class="stat-label">禁用节点</div></div></div></div>
+<div class="section"><h2>添加节点</h2><div class="form-group"><label>IP地址</label><input id="newIp" placeholder="IPv4: 192.168.1.1 | IPv6: [2001:db8::1] | 域名: example.com"></div><div class="form-row"><div class="form-group"><label>端口号</label><input id="newPort" placeholder="443" value="443"></div><div class="form-group"><label>节点名称</label><input id="newName" placeholder="香港节点01-HK"></div><div class="form-group"><label>优先级</label><input id="newPriority" type="number" placeholder="自动分配" min="0"></div></div><button onclick="addIp()">添加节点</button></div>
+<div class="section"><h2>批量操作</h2><div class="form-group"><label>节点列表（每行一个，支持 IP:端口#名称 格式）</label><textarea id="batchIps" placeholder="192.168.1.1:443#香港-HK&#10;[2001:db8::1]:443#日本-JP&#10;example.com:443#美国-US"></textarea></div><div class="batch-actions"><button onclick="batchImport()">批量导入</button><button class="danger" onclick="batchDelete()">批量删除</button></div></div>
+<div class="section"><h2>配置生成</h2><button class="purple" onclick="location.href='/Vless'">生成 Vless 链接</button></div>
+<div class="section"><h2>节点列表</h2><div id="message"></div><div class="actions"><button onclick="loadIps()">刷新</button><button class="purple" onclick="sortByRegion()">按地区排序</button><button class="purple" onclick="reorderPriority()">调整优先级</button><button class="purple" onclick="sortByPriority()">按优先级排序</button><button class="orange" onclick="removeDuplicates()">一键去重</button><button class="success" onclick="toggleAll(1)">全部启用</button><button class="secondary" onclick="toggleAll(0)">全部禁用</button><button class="danger" onclick="clearAll()">清空所有</button></div><div id="ipContainer"><div class="loading"><div class="spinner"></div><div>正在加载...</div></div></div><div id="pagination" class="pagination"><button id="prevBtn" class="secondary" onclick="loadIps(page-1,1)">上一页</button><span id="pageInfo" class="page-info">第 1 页</span><button id="nextBtn" class="secondary" onclick="loadIps(page+1,1)">下一页</button></div></div>
 </div>
-
-<div id="editModal" class="modal">
-	<div class="modal-content">
-		<div class="modal-header">
-			<div class="modal-title">编辑节点</div>
-			<button class="close-btn" onclick="closeModal()">&times;</button>
-		</div>
-		<form onsubmit="saveEdit(event)">
-			<div class="form-group">
-				<label>IP地址</label>
-				<input id="editIp" required>
-			</div>
-			<div class="form-row">
-				<div class="form-group">
-					<label>端口号</label>
-					<input id="editPort" required>
-				</div>
-				<div class="form-group">
-					<label>节点名称</label>
-					<input id="editName">
-				</div>
-				<div class="form-group">
-					<label>优先级</label>
-					<input id="editPriority" type="number" required min="0">
-				</div>
-			</div>
-			<div class="modal-buttons">
-				<button type="submit">保存更改</button>
-				<button type="button" class="secondary" onclick="closeModal()">取消</button>
-			</div>
-		</form>
-	</div>
-</div>
-
+<div id="editModal" class="modal"><div class="modal-content"><div class="modal-header"><div class="modal-title">编辑节点</div><button class="close-btn" onclick="closeModal()">&times;</button></div><form onsubmit="saveEdit(event)"><div class="form-group"><label>IP地址</label><input id="editIp" required></div><div class="form-row"><div class="form-group"><label>端口号</label><input id="editPort" required></div><div class="form-group"><label>节点名称</label><input id="editName"></div><div class="form-group"><label>优先级</label><input id="editPriority" type="number" required min="0"></div></div><div class="modal-buttons"><button type="submit">保存</button><button type="button" class="secondary" onclick="closeModal()">取消</button></div></form></div></div>
 <script>
-const API='/api',PAGE_SIZE=${PAGE_SIZE};
-let editId=null,currentPage=1,totalPages=1,pollInterval=null;
+const API='/api',PS=${PAGE_SIZE};
+let editId=null,page=1,pages=1,scroll=0,poll=null;
 
-// 保存滚动位置
-let scrollPosition = 0;
+const $=id=>document.getElementById(id);
+const msg=(t,c='success')=>{$('message').innerHTML='<div class="message '+c+'">'+t+'</div>';setTimeout(()=>$('message').innerHTML='',5e3)};
 
-const saveScrollPosition = () => {
-	scrollPosition = window.scrollY || document.documentElement.scrollTop;
-};
+const api=async(e,o={})=>{const r=await fetch(API+e,{headers:{'Content-Type':'application/json'},...o});const d=await r.json();if(!r.ok)throw new Error(d.error);return d};
 
-const restoreScrollPosition = () => {
-	requestAnimationFrame(() => {
-		window.scrollTo(0, scrollPosition);
-	});
-};
+const pollTask=(id,cb)=>{if(poll)clearInterval(poll);poll=setInterval(async()=>{try{const{status,message}=await api('/task/'+id);if(status==='completed'){clearInterval(poll);msg(message);cb&&cb()}else if(status==='failed'){clearInterval(poll);msg(message,'error')}}catch{clearInterval(poll)}},1e3)};
 
-const msg=(t,type='success')=>{
-	const messageEl=document.getElementById('message');
-	messageEl.innerHTML=\`<div class="message \${type}">\${t}</div>\`;
-	setTimeout(()=>messageEl.innerHTML='',5000);
-};
+const loadStats=async()=>{try{const{total,active,inactive}=await api('/ips/stats');$('total').textContent=total;$('active').textContent=active;$('inactive').textContent=inactive}catch{}};
 
-const api=async(e,o={})=>{
-	try{
-		const r=await fetch(API+e,{headers:{'Content-Type':'application/json'},...o});
-		const d=await r.json();
-		if(!r.ok)throw new Error(d.error);
-		return d;
-	}catch(error){
-		msg(error.message,'error');
-		throw error;
-	}
-};
+const loadIps=async(p=1,k=0)=>{if(k)scroll=window.scrollY;p=Math.max(1,p);const c=$('ipContainer');c.innerHTML='<div class="loading"><div class="spinner"></div><div>加载中...</div></div>';try{const{ips,pagination}=await api('/ips?page='+p+'&limit='+PS+'&needTotal=true');page=pagination.page;pages=pagination.pages||1;$('pageInfo').textContent='第 '+page+' 页 / 共 '+pages+' 页';$('prevBtn').disabled=page===1;$('nextBtn').disabled=page===pages;c.innerHTML=ips.length?'<ul class="ip-list">'+ips.map(ip=>'<li class="ip-item"><div class="ip-info"><div class="ip-details"><div class="ip-address">'+ip.displayIp+':'+ip.port+'</div><div class="ip-meta">'+(ip.name?'<span class="node-name">'+ip.name+'</span>':'')+(ip.region?'<span class="region-tag">'+ip.region+'</span>':'')+'<span class="priority-tag">优先级: '+ip.priority+'</span></div></div><span class="status '+(ip.active?'active':'inactive')+'">'+(ip.active?'启用中':'已禁用')+'</span></div><div class="ip-actions"><button class="small" onclick="editIp('+ip.id+',\\''+ip.displayIp+'\\',\\''+ip.port+'\\',\\''+(ip.name||'')+'\\','+ip.priority+')">编辑</button><button class="small" onclick="toggleIp('+ip.id+','+ip.active+')">'+(ip.active?'禁用':'启用')+'</button><button class="small danger" onclick="deleteIp('+ip.id+')">删除</button></div></li>').join('')+'</ul>':'<div class="empty">暂无数据</div>';loadStats();if(k)setTimeout(()=>window.scrollTo(0,scroll),50)}catch{c.innerHTML='<div class="empty">加载失败</div>'}};
 
-const pollTask=async(taskId,onComplete)=>{
-	if(pollInterval)clearInterval(pollInterval);
-	pollInterval=setInterval(async()=>{
-		try{
-			const{status,message}=await api(\`/task/\${taskId}\`);
-			if(status==='completed'){
-				clearInterval(pollInterval);
-				msg(message||'操作完成');
-				if(onComplete)onComplete();
-			}else if(status==='failed'){
-				clearInterval(pollInterval);
-				msg(message||'操作失败','error');
-			}
-		}catch{
-			clearInterval(pollInterval);
-		}
-	},1000);
-};
+const sortByRegion=async()=>{try{const{taskId}=await api('/ips/sort',{method:'POST'});msg('排序任务启动...');pollTask(taskId,()=>loadIps(page,1))}catch{}};
+const sortByPriority=async()=>{try{const{taskId}=await api('/ips/sort-priority',{method:'POST'});msg('排序任务启动...');pollTask(taskId,()=>loadIps(page,1))}catch{}};
+const removeDuplicates=async()=>{if(!confirm('确定要去重吗？'))return;try{const{taskId}=await api('/ips/remove-duplicates',{method:'POST'});msg('去重任务启动...');pollTask(taskId,()=>loadIps(page,1))}catch{}};
+const reorderPriority=async()=>{try{const{taskId}=await api('/ips/reorder-priority',{method:'POST'});msg('优先级调整启动...');pollTask(taskId,()=>loadIps(page,1))}catch{}};
 
-const loadStats=async()=>{
-	try{
-		const{total,active,inactive}=await api('/ips/stats');
-		document.getElementById('total').textContent=total;
-		document.getElementById('active').textContent=active;
-		document.getElementById('inactive').textContent=inactive;
-	}catch{}
-};
+const addIp=async()=>{const ip=$('newIp').value.trim(),port=$('newPort').value.trim(),name=$('newName').value.trim(),priority=$('newPriority').value.trim();if(!ip)return msg('请输入IP','error');let full=ip;if(port){if(ip.startsWith('[')&&ip.includes(']')){const e=ip.indexOf(']');full=ip.slice(0,e+1)+':'+port}else if(!ip.includes(':'))full+=':'+port}if(name)full+='#'+name;try{await api('/ips',{method:'POST',body:JSON.stringify({ip:full,priority:priority?+priority:undefined})});msg('添加成功');['newIp','newName','newPriority'].forEach(id=>$(id).value='');$('newPort').value='443';loadIps(page,1)}catch{}};
 
-const loadIps = async (page = 1, keepScroll = false) => {
-    if (keepScroll) {
-        saveScrollPosition();
-    }
-    
-    const c = document.getElementById('ipContainer');
-    c.innerHTML = '<div class="loading"><div class="spinner"></div><div>正在加载节点数据...</div></div>';
-    try {
-      const { ips, pagination } = await api(\`/ips?page=\${page}&limit=\${PAGE_SIZE}&needTotal=true\`);
-      currentPage = pagination.page;
-      totalPages = pagination.pages || 1;
-      document.getElementById('pageInfo').textContent = \`第 \${currentPage} 页 / 共 \${totalPages} 页\`;
-      document.getElementById('pagination').style.display = 'flex';
-      document.getElementById('prevPageBtn').disabled = currentPage === 1;
-      document.getElementById('nextPageBtn').disabled = currentPage === totalPages;
-      c.innerHTML = ips.length ? \`
-        <ul class="ip-list">
-          \${ips.map(ip => \`
-            <li class="ip-item">
-              <div class="ip-info">
-                <div class="ip-details">
-                  <div class="ip-address">\${ip.displayIp}:\${ip.port}</div>
-                  <div class="ip-meta">
-                    \${ip.name ? \`<span class="node-name">\${ip.name}</span>\` : ''}
-                    \${ip.region ? \`<span class="region-tag">\${ip.region}</span>\` : ''}
-                    <span class="priority-tag">优先级: \${ip.priority}</span>
-                  </div>
-                </div>
-                <span class="status \${ip.active ? 'active' : 'inactive'}">\${ip.active ? '启用中' : '已禁用'}</span>
-              </div>
-              <div class="ip-actions">
-                <button class="small tooltip" data-tooltip="编辑节点" onclick="editIp(\${ip.id},'\${ip.displayIp}','\${ip.port}','\${ip.name || ''}',\${ip.priority})">编辑</button>
-                <button class="small tooltip" data-tooltip="\${ip.active ? '禁用节点' : '启用节点'}" onclick="toggleIp(\${ip.id},\${ip.active})">\${ip.active ? '禁用' : '启用'}</button>
-                <button class="small danger tooltip" data-tooltip="删除节点" onclick="deleteIp(\${ip.id})">删除</button>
-              </div>
-            </li>
-          \`).join('')}
-        </ul>
-      \` : '<div class="empty">暂无节点数据</div>';
-      loadStats();
-      
-      if (keepScroll) {
-          setTimeout(restoreScrollPosition, 50);
-      }
-    } catch (error) {
-      console.error('Load IPs failed:', error);
-      c.innerHTML = '<div class="empty">加载失败，请重试</div>';
-    }
-  };
+const batchImport=async()=>{const lines=$('batchIps').value.split('\\n').map(l=>l.trim()).filter(l=>l&&!l.startsWith('#'));if(!lines.length)return msg('请输入节点','error');try{const{count,taskId}=await api('/ips/batch',{method:'POST',body:JSON.stringify({ips:lines})});msg('导入启动('+count+'条)...');pollTask(taskId,()=>{$('batchIps').value='';loadIps(page,1)})}catch{}};
 
-const prevPage=()=>{
-	saveScrollPosition();
-	loadIps(currentPage-1, true);
-};
-const nextPage=()=>{
-	saveScrollPosition();
-	loadIps(currentPage+1, true);
-};
+const batchDelete=async()=>{const lines=$('batchIps').value.split('\\n').map(l=>l.trim()).filter(l=>l&&!l.startsWith('#'));if(!lines.length)return msg('请输入节点','error');if(!confirm('确定删除？'))return;try{const{count,taskId}=await api('/ips/batch-delete',{method:'POST',body:JSON.stringify({ips:lines})});msg('删除启动('+count+'条)...');pollTask(taskId,()=>{$('batchIps').value='';loadIps(page,1)})}catch{}};
 
-const sortByRegion=async()=>{
-	try{
-		const{taskId,async}=await api('/ips/sort',{method:'POST'});
-		if(async){
-			msg('排序任务启动，等待完成...');
-			pollTask(taskId,()=>loadIps(currentPage, true));
-		}else{
-			msg('排序完成');
-			loadIps(currentPage, true);
-		}
-	}catch{}
-};
+const editIp=(id,ip,port,name,priority)=>{editId=id;$('editIp').value=ip;$('editPort').value=port;$('editName').value=name;$('editPriority').value=priority;$('editModal').style.display='flex'};
+const closeModal=()=>{$('editModal').style.display='none';editId=null};
 
-const sortByPriority=async()=>{
-	try{
-		const{taskId,async}=await api('/ips/sort-priority',{method:'POST'});
-		if(async){
-			msg('按优先级排序任务启动，等待完成...');
-			pollTask(taskId,()=>loadIps(currentPage, true));
-		}else{
-			msg('按优先级排序完成');
-			loadIps(currentPage, true);
-		}
-	}catch{}
-};
+const saveEdit=async e=>{e.preventDefault();const ip=$('editIp').value.trim(),port=$('editPort').value.trim(),name=$('editName').value.trim(),priority=$('editPriority').value.trim();if(!ip||!port)return msg('IP和端口必填','error');let full=ip.startsWith('[')?ip:ip;if(!full.includes(':'))full+=':'+port;if(name)full+='#'+name;try{await api('/ips/'+editId,{method:'PUT',body:JSON.stringify({ip:full,priority:+priority||0})});msg('更新成功');closeModal();loadIps(page,1)}catch{}};
 
-const removeDuplicates=async()=>{
-	if(!confirm('确定要删除所有重复的节点吗？此操作将根据IP地址（忽略端口）判断重复，不可撤销！'))return;
-	try{
-		const{taskId,async}=await api('/ips/remove-duplicates',{method:'POST'});
-		if(async){
-			msg('去重任务启动，等待完成...');
-			pollTask(taskId,()=>loadIps(currentPage, true));
-		}else{
-			msg('去重完成');
-			loadIps(currentPage, true);
-		}
-	}catch{}
-};
+const toggleIp=async(id,active)=>{try{await api('/ips/'+id,{method:'PUT',body:JSON.stringify({active:active?0:1})});msg(active?'已禁用':'已启用');loadIps(page,1)}catch{}};
+const deleteIp=async id=>{if(!confirm('确定删除？'))return;try{await api('/ips/'+id,{method:'DELETE'});msg('删除成功');loadIps(page,1)}catch{}};
 
-const reorderPriority=async()=>{
-	try{
-		const{taskId,async}=await api('/ips/reorder-priority',{method:'POST'});
-		if(async){
-			msg('优先级调整启动，等待完成...');
-			pollTask(taskId,()=>loadIps(currentPage, true));
-		}else{
-			msg('调整完成');
-			loadIps(currentPage, true);
-		}
-	}catch{}
-};
+const toggleAll=async active=>{if(!confirm(active?'启用全部？':'禁用全部？'))return;try{const{taskId}=await api('/ips/toggle-all',{method:'POST',body:JSON.stringify({active})});msg('操作启动...');pollTask(taskId,()=>loadIps(page,1))}catch{}};
 
-const addIp=async()=>{
-	const ip=document.getElementById('newIp').value.trim();
-	const port=document.getElementById('newPort').value.trim();
-	const name=document.getElementById('newName').value.trim();
-	const priority=document.getElementById('newPriority').value.trim();
-	if(!ip)return msg('请输入IP地址','error');
-	let full=ip;
-	if(port){
-		if(ip.startsWith('[')&&ip.includes(']')){
-			const e=ip.indexOf(']');
-			full=ip.substring(0,e+1)+':'+port;
-		}else if(!ip.includes(':')){
-			full+=':'+port;
-		}
-	}
-	if(name)full+=\`#\${name}\`;
-	try{
-		await api('/ips',{method:'POST',body:JSON.stringify({ip:full,priority:priority?parseInt(priority):undefined})});
-		msg('节点添加成功');
-		['newIp','newPort','newName','newPriority'].forEach(id=>document.getElementById(id).value='');
-		document.getElementById('newPort').value='443';
-		loadIps(currentPage, true);
-	}catch{}
-};
+const clearAll=async()=>{if(!confirm('清空所有？')||!confirm('⚠️ 不可恢复！'))return;try{const{taskId}=await api('/ips/clear',{method:'DELETE'});msg('清空启动...');pollTask(taskId,()=>loadIps(1))}catch{}};
 
-const batchImport=async()=>{
-	const lines=document.getElementById('batchIps').value.split('\\n').map(l=>l.trim()).filter(l=>l&&!l.startsWith('#'));
-	if(!lines.length)return msg('请输入要导入的节点列表','error');
-	try{
-		const{count,async,taskId}=await api('/ips/batch',{method:'POST',body:JSON.stringify({ips:lines})});
-		if(async){
-			msg(\`批量导入启动（\${count}条），等待完成...\`);
-			pollTask(taskId,()=>{
-				document.getElementById('batchIps').value='';
-				loadIps(currentPage, true);
-			});
-		}else{
-			msg(\`成功导入 \${count} 条节点\`);
-			document.getElementById('batchIps').value='';
-			loadIps(currentPage, true);
-		}
-	}catch{}
-};
-
-const batchDelete=async()=>{
-	const lines=document.getElementById('batchIps').value.split('\\n').map(l=>l.trim()).filter(l=>l&&!l.startsWith('#'));
-	if(!lines.length)return msg('请输入要删除的节点列表','error');
-	if(!confirm('确定要删除这些节点吗？此操作不可撤销！'))return;
-	const ips=[];
-	lines.forEach(line=>{
-		const match=line.match(/@([^?]+)?/);
-		if(match)ips.push(match[1]);
-		else{
-			const h=line.indexOf('#');
-			let ipPart=h>-1?line.substring(0,h):line;
-			if(!ipPart.includes(':'))ipPart+=':443';
-			ips.push(ipPart);
-		}
-	});
-	if(!ips.length)return msg('未提取到有效的IP地址','error');
-	try{
-		const{count,async,taskId}=await api('/ips/batch-delete',{method:'POST',body:JSON.stringify({ips})});
-		if(async){
-			msg(\`批量删除启动（\${count}条），等待完成...\`);
-			pollTask(taskId,()=>{
-				document.getElementById('batchIps').value='';
-				loadIps(currentPage, true);
-			});
-		}else{
-			msg(\`成功删除 \${count} 条节点\`);
-			document.getElementById('batchIps').value='';
-			loadIps(currentPage, true);
-		}
-	}catch{}
-};
-
-const editIp=(id,ip,port,name,priority)=>{
-	editId=id;
-	document.getElementById('editIp').value=ip;
-	document.getElementById('editPort').value=port;
-	document.getElementById('editName').value=name;
-	document.getElementById('editPriority').value=priority;
-	document.getElementById('editModal').style.display='flex';
-};
-
-const closeModal=()=>{
-	document.getElementById('editModal').style.display='none';
-	editId=null;
-};
-
-const saveEdit=async e=>{
-	e.preventDefault();
-	const ip=document.getElementById('editIp').value.trim();
-	const port=document.getElementById('editPort').value.trim();
-	const name=document.getElementById('editName').value.trim();
-	const priority=document.getElementById('editPriority').value.trim();
-	if(!ip||!port)return msg('IP地址和端口号不能为空','error');
-	let full=ip.startsWith('[')?ip:ip;
-	if(!full.includes(':'))full+=':'+port;
-	if(name)full+=\`#\${name}\`;
-	try{
-		await api(\`/ips/\${editId}\`,{method:'PUT',body:JSON.stringify({ip:full,priority:parseInt(priority)||0})});
-		msg('节点信息更新成功');
-		closeModal();
-		loadIps(currentPage, true);
-	}catch{}
-};
-
-const toggleIp=async(id,active)=>{
-	try{
-		await api(\`/ips/\${id}\`,{method:'PUT',body:JSON.stringify({active:active?0:1})});
-		msg(\`节点已\${active?'禁用':'启用'}\`);
-		loadIps(currentPage, true);
-	}catch{}
-};
-
-const deleteIp=async id=>{
-	if(!confirm('确定要删除这个节点吗？此操作不可撤销！'))return;
-	try{
-		await api(\`/ips/\${id}\`,{method:'DELETE'});
-		msg('节点删除成功');
-		loadIps(currentPage, true);
-	}catch{}
-};
-
-const toggleAll=async active=>{
-	const action=active?'启用':'禁用';
-	if(!confirm(\`确定要\${action}所有节点吗？\`))return;
-	try{
-		const{taskId,async}=await api('/ips/toggle-all',{method:'POST',body:JSON.stringify({active})});
-		if(async){
-			msg(\`批量\${action}启动，等待完成...\`);
-			pollTask(taskId,()=>loadIps(currentPage, true));
-		}else{
-			msg(\`所有节点已\${action}\`);
-			loadIps(currentPage, true);
-		}
-	}catch{}
-};
-
-const clearAll=async()=>{
-	if(!confirm('确定要清空所有节点吗？')||!confirm('⚠️  此操作不可恢复！请再次确认！'))return;
-	try{
-		const{taskId,async}=await api('/ips/clear',{method:'DELETE'});
-		if(async){
-			msg('清空任务启动，等待完成...');
-			pollTask(taskId,()=>loadIps(1));
-		}else{
-			msg('所有节点已清空');
-			loadIps(1);
-		}
-	}catch{}
-};
-
-document.getElementById('editModal').onclick=e=>{
-	if(e.target===e.currentTarget)closeModal();
-};
-
-// 初始化加载
+$('editModal').onclick=e=>{if(e.target===e.currentTarget)closeModal()};
 loadIps();
 </script>
 </body>
 </html>`;
 
-// --- 主 Fetch Handler ---
+// --- 主入口 ---
 export default {
     async fetch(req, env, ctx) {
         const url = new URL(req.url);
+        const path = url.pathname;
 
-        if (url.pathname === '/') {
-            return new Response(getHTML(), { headers: { 'Content-Type': 'text/html;charset=utf-8' } });
+        // 首页
+        if (path === '/') {
+            return new Response(getHTML(), {
+                headers: { 'Content-Type': 'text/html;charset=utf-8' }
+            });
         }
 
-        if (url.pathname === '/Vless') {
+        // VLESS 订阅（带缓存）
+        if (path === '/Vless') {
             const host = url.searchParams.get('host') || HOST;
-            const cacheKey = new Request(req.url, req);
             const cache = caches.default;
+            const cacheKey = new Request(req.url, req);
+
+            // 尝试从缓存读取
             let res = await cache.match(cacheKey);
             if (res) return res;
 
-            const { results } = await env.DB.prepare('SELECT ip, name FROM ips WHERE active=1 ORDER BY priority, id LIMIT ?').bind(MAX_VLESS).all();
-            const links = results.map((ipRow) => generateVless(ipRow, host)).join('\n');
-            
-            res = new Response(links || '暂无节点', { headers: { 'Content-Type': 'text/plain;charset=utf-8', 'Cache-Control': 'public, max-age=60' } });
+            // 查询数据库
+            const { results } = await env.DB.prepare(
+                'SELECT ip, name FROM ips WHERE active=1 ORDER BY priority, id LIMIT ?'
+            ).bind(MAX_VLESS).all();
+
+            // 批量生成 VLESS 链接
+            const links = results.map(row => generateVless(row, host)).join('\n');
+
+            res = new Response(links || '暂无节点', {
+                headers: {
+                    'Content-Type': 'text/plain;charset=utf-8',
+                    'Cache-Control': `public, max-age=${CACHE_TTL}`
+                }
+            });
+
             ctx.waitUntil(cache.put(cacheKey, res.clone()));
             return res;
         }
 
-        if (url.pathname.startsWith('/api/')) {
+        // API 路由
+        if (path.startsWith('/api/')) {
             return route(req, env.DB, ctx, env.TASK_KV);
         }
 
