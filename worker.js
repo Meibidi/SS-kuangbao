@@ -123,8 +123,9 @@ const parseAddress = (data, offset) => {
 // ==================== 连接策略 ====================
 
 // 单次连接 Promise
+// allowHalfOpen: false 确保 TCP FIN 时立即关闭双向，减少资源占用
 const createConnect = (hostname, port) => {
-  const socket = connect({ hostname, port });
+  const socket = connect({ hostname, port, allowHalfOpen: false });
   return socket.opened.then(() => socket);
 };
 
@@ -276,6 +277,23 @@ const createUplinkPump = (tcpWritable, shutdown) => {
 
   return { enqueue, close };
 };
+
+// ==================== JIT 预热 ====================
+// 在 Worker 冷启动时预热关键函数，确保 V8 提前编译并填充 IC
+(() => {
+  // 预热 Base64 解码 (使用真实的 UUID Base64 编码)
+  const warmupB64 = 'VVnZOBuKRUuYGmrP6PVtjA==';
+  decodeBase64(warmupB64);
+
+  // 预热 UUID 验证
+  const warmupData = new Uint8Array(18);
+  warmupData.set(UUID, 1);
+  verifyUUID(warmupData);
+
+  // 预热地址解析 (IPv4 场景)
+  const warmupAddr = new Uint8Array([0, 0, 0, 1, 127, 0, 0, 1]);
+  parseAddress(warmupAddr, -3); // offset=-3 使 atype 位于 [0]
+})();
 
 // ==================== 主处理器 ====================
 
